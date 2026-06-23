@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use ratatui::widgets::{ListState, TableState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    config::{ColumnConfig, ProfileManager},
-    discord::DiscordClient,
+    analytics::AnalyticsSummary,
+    config::{AutomationRule, ColumnConfig, FilterPreset, ProfileManager, RuleActionType,
+             RuleConditionOp, RuleConditionSource},
+    discord::{AuditEntry, DiscordClient, Role},
     error::Result,
     faq::FaqManager,
     logger::{ActivityLogger, LogEntry},
@@ -24,41 +26,104 @@ pub enum Screen {
     Activity,
     Settings,
     Database,
+    Analytics,  // key 9 — Track D
+    Automation, // key 0 — Track F
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode { Normal, Editing }
 
-/// Sub-mode within the Database screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DbMode {
     Browse,
     ConfigureColumns,
     SwitchDatabase,
     EditCell,
+    ViewBody,       // Track C: inline page-body viewer
+    FilterPresets,  // Track C: named filter picker
 }
 
-// ── Async events (API → TUI) ──────────────────────────────────────────────────
+// ── Async events ──────────────────────────────────────────────────────────────
 
 pub enum AppEvent {
+    // Members / shared Notion
     SchemaLoaded(Schema),
     MembersLoaded(Vec<Page>),
     MemberCreated(Page),
     MemberUpdated(Page),
     MemberRemoved,
-    DiscordInvite(String),          // url
+    // Discord
+    DiscordInvite(String),
     DiscordMembersLoaded(Vec<crate::discord::Member>),
+    DiscordRolesLoaded(Vec<Role>),
+    DiscordAuditLoaded(Vec<AuditEntry>),
+    // Activity
     ActivityLoaded(Vec<LogEntry>),
-    StatusMsg(String),
-    ErrMsg(String),
-    // ── Database tab ──────────────────────────────────────────────────────
+    // Database tab
     DbSchemaLoaded(Schema),
     DbRowsLoaded(Vec<Page>),
     DbDatabasesListed(Vec<DbRef>),
     DbRowUpdated(Page),
+    DbPageBodyLoaded(String),
+    // Analytics
+    AnalyticsSummaryLoaded(AnalyticsSummary),
+    // Automation
+    AutomationRuleResult { rule_id: String, result: String },
+    // Global search (Track G)
+    GlobalSearchResults(Vec<SearchResult>),
+    // Generic
+    StatusMsg(String),
+    ErrMsg(String),
 }
 
-// ── Per-screen state structs ──────────────────────────────────────────────────
+// ── Search types (Track G) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchSource { Notion, Discord, Faq, Activity }
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub source: SearchSource,
+    pub id: String,
+    pub title: String,
+    pub preview: String,
+}
+
+// ── Undo stack (Track A) ──────────────────────────────────────────────────────
+
+pub enum UndoAction {
+    UpdatePage { page_id: String, old_props: HashMap<String, serde_json::Value> },
+    CreatePage { page_id: String },
+}
+
+// ── Command palette (Track A) ─────────────────────────────────────────────────
+
+pub struct PaletteCmd {
+    pub keys: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+pub const PALETTE_CMDS: &[PaletteCmd] = &[
+    PaletteCmd { keys: "1 dash",       label: "Dashboard",      description: "Go to Dashboard" },
+    PaletteCmd { keys: "2 mem",        label: "Members",        description: "Go to Members (2)" },
+    PaletteCmd { keys: "3 dis",        label: "Discord",        description: "Go to Discord (3)" },
+    PaletteCmd { keys: "4 faq",        label: "FAQ",            description: "Go to FAQ (4)" },
+    PaletteCmd { keys: "5 pay",        label: "Payments",       description: "Go to Payments (5)" },
+    PaletteCmd { keys: "6 log act",    label: "Activity Log",   description: "Go to Activity (6)" },
+    PaletteCmd { keys: "7 set",        label: "Settings",       description: "Go to Settings (7)" },
+    PaletteCmd { keys: "8 db database",label: "Database",       description: "Go to Database (8)" },
+    PaletteCmd { keys: "9 an stat",    label: "Analytics",      description: "Go to Analytics (9)" },
+    PaletteCmd { keys: "0 auto rule",  label: "Automation",     description: "Go to Automation (0)" },
+    PaletteCmd { keys: "search glob",  label: "Global Search",  description: "Open global search (`)" },
+    PaletteCmd { keys: "refresh ref",  label: "Refresh",        description: "Refresh current view (r/F5)" },
+    PaletteCmd { keys: "export csv",   label: "Export CSV",     description: "Export log as CSV" },
+    PaletteCmd { keys: "onboard new",  label: "Onboard Member", description: "Run onboarding pipeline" },
+    PaletteCmd { keys: "run rules",    label: "Run All Rules",  description: "Execute all automation rules" },
+    PaletteCmd { keys: "quit q",       label: "Quit",           description: "Quit the application" },
+];
+
+// ── Per-screen form types ─────────────────────────────────────────────────────
 
 pub struct FormField {
     pub key: String,
@@ -79,12 +144,8 @@ pub struct MemberForm {
 impl MemberForm {
     pub fn for_schema(schema: &Schema) -> Self {
         let fields = schema.editable().map(|p| FormField {
-            key: p.name.clone(),
-            label: p.name.clone(),
-            value: String::new(),
-            kind: p.kind.clone(),
-            options: p.options.clone(),
-            opt_idx: 0,
+            key: p.name.clone(), label: p.name.clone(), value: String::new(),
+            kind: p.kind.clone(), options: p.options.clone(), opt_idx: 0,
         }).collect();
         MemberForm { is_edit: false, page_id: None, fields, active: 0 }
     }
@@ -94,8 +155,8 @@ impl MemberForm {
             let value = page.display(&p.name);
             let opt_idx = p.options.iter().position(|o| o == &value).unwrap_or(0);
             FormField {
-                key: p.name.clone(), label: p.name.clone(),
-                value, kind: p.kind.clone(), options: p.options.clone(), opt_idx,
+                key: p.name.clone(), label: p.name.clone(), value,
+                kind: p.kind.clone(), options: p.options.clone(), opt_idx,
             }
         }).collect();
         MemberForm { is_edit: true, page_id: Some(page.id.clone()), fields, active: 0 }
@@ -103,11 +164,9 @@ impl MemberForm {
 
     pub fn to_props(&self) -> HashMap<String, serde_json::Value> {
         self.fields.iter().map(|f| {
-            let val = if f.kind == "select" || f.kind == "multi_select" || f.kind == "status" {
+            let val = if matches!(f.kind.as_str(), "select" | "multi_select" | "status") {
                 f.options.get(f.opt_idx).cloned().unwrap_or_else(|| f.value.clone())
-            } else {
-                f.value.clone()
-            };
+            } else { f.value.clone() };
             (f.key.clone(), build_prop(&f.kind, &val))
         }).collect()
     }
@@ -136,40 +195,154 @@ pub struct ProfileForm {
 impl ProfileForm {
     pub fn new() -> Self {
         ProfileForm {
-            is_edit: false, original_name: None,
-            name: String::new(), notion_key: String::new(), notion_db: String::new(),
-            discord_token: String::new(), discord_guild: String::new(), discord_channel: String::new(),
-            active: 0,
+            is_edit: false, original_name: None, name: String::new(),
+            notion_key: String::new(), notion_db: String::new(),
+            discord_token: String::new(), discord_guild: String::new(),
+            discord_channel: String::new(), active: 0,
         }
     }
     pub fn from_profile(p: &crate::config::Profile) -> Self {
         ProfileForm {
             is_edit: true, original_name: Some(p.name.clone()),
             name: p.name.clone(), notion_key: p.notion_api_key.clone(),
-            notion_db: p.notion_database_id.clone(), discord_token: p.discord_bot_token.clone(),
-            discord_guild: p.discord_guild_id.clone(), discord_channel: p.discord_default_channel_id.clone(),
-            active: 0,
+            notion_db: p.notion_database_id.clone(),
+            discord_token: p.discord_bot_token.clone(),
+            discord_guild: p.discord_guild_id.clone(),
+            discord_channel: p.discord_default_channel_id.clone(), active: 0,
         }
     }
     pub fn field_labels() -> &'static [&'static str] {
-        &["Profile name","Notion API key","Notion database ID","Discord bot token","Discord guild ID","Discord default channel ID"]
+        &["Profile name","Notion API key","Notion database ID",
+          "Discord bot token","Discord guild ID","Discord default channel ID"]
     }
     pub fn field_values(&self) -> Vec<&str> {
-        vec![&self.name,&self.notion_key,&self.notion_db,&self.discord_token,&self.discord_guild,&self.discord_channel]
+        vec![&self.name, &self.notion_key, &self.notion_db,
+             &self.discord_token, &self.discord_guild, &self.discord_channel]
     }
     pub fn field_value_mut(&mut self, i: usize) -> Option<&mut String> {
         match i {
-            0 => Some(&mut self.name), 1 => Some(&mut self.notion_key), 2 => Some(&mut self.notion_db),
-            3 => Some(&mut self.discord_token), 4 => Some(&mut self.discord_guild), 5 => Some(&mut self.discord_channel),
+            0 => Some(&mut self.name),         1 => Some(&mut self.notion_key),
+            2 => Some(&mut self.notion_db),    3 => Some(&mut self.discord_token),
+            4 => Some(&mut self.discord_guild), 5 => Some(&mut self.discord_channel),
             _ => None,
         }
     }
 }
 
+/// Form for creating / editing an automation rule.
+pub struct AutoRuleForm {
+    pub is_edit: bool,
+    pub original_id: Option<String>,
+    // fields (active index 0-9)
+    pub name: String,
+    pub cond_source: RuleConditionSource,
+    pub cond_field: String,
+    pub cond_op: RuleConditionOp,
+    pub cond_value: String,
+    pub action_type: RuleActionType,
+    pub action_target: String,
+    pub action_value: String,
+    pub action_field_kind: String,
+    pub enabled: bool,
+    pub active: usize,
+}
+
+impl AutoRuleForm {
+    pub fn new() -> Self {
+        AutoRuleForm {
+            is_edit: false, original_id: None, name: String::new(),
+            cond_source: RuleConditionSource::Notion, cond_field: String::new(),
+            cond_op: RuleConditionOp::Equals, cond_value: String::new(),
+            action_type: RuleActionType::AddDiscordRole, action_target: String::new(),
+            action_value: String::new(), action_field_kind: String::new(), enabled: true, active: 0,
+        }
+    }
+    pub fn from_rule(r: &AutomationRule) -> Self {
+        AutoRuleForm {
+            is_edit: true, original_id: Some(r.id.clone()), name: r.name.clone(),
+            cond_source: r.condition.source.clone(), cond_field: r.condition.field.clone(),
+            cond_op: r.condition.op.clone(), cond_value: r.condition.value.clone(),
+            action_type: r.action.action_type.clone(), action_target: r.action.target.clone(),
+            action_value: r.action.value.clone(), action_field_kind: r.action.field_kind.clone(),
+            enabled: r.enabled, active: 0,
+        }
+    }
+    pub fn field_count() -> usize { 10 }
+    pub fn field_label(i: usize) -> &'static str {
+        match i {
+            0 => "Rule name",          1 => "Condition source (←/→)",
+            2 => "Condition field",    3 => "Condition op (←/→)",
+            4 => "Condition value",    5 => "Action type (←/→)",
+            6 => "Action target",      7 => "Action value",
+            8 => "Field kind (if SetNotionField)", 9 => "Enabled (←/→)",
+            _ => "",
+        }
+    }
+    pub fn field_display(&self, i: usize) -> String {
+        match i {
+            0 => self.name.clone(),
+            1 => self.cond_source.label().into(),
+            2 => self.cond_field.clone(),
+            3 => self.cond_op.label().into(),
+            4 => self.cond_value.clone(),
+            5 => self.action_type.label().into(),
+            6 => self.action_target.clone(),
+            7 => self.action_value.clone(),
+            8 => self.action_field_kind.clone(),
+            9 => if self.enabled { "yes" } else { "no" }.into(),
+            _ => String::new(),
+        }
+    }
+    pub fn field_value_mut(&mut self, i: usize) -> Option<&mut String> {
+        match i {
+            0 => Some(&mut self.name),           2 => Some(&mut self.cond_field),
+            4 => Some(&mut self.cond_value),     6 => Some(&mut self.action_target),
+            7 => Some(&mut self.action_value),   8 => Some(&mut self.action_field_kind),
+            _ => None,
+        }
+    }
+    pub fn cycle_left(&mut self, i: usize) {
+        match i {
+            1 => self.cond_source = self.cond_source.cycle(),
+            3 => self.cond_op = self.cond_op.cycle(),
+            5 => self.action_type = self.action_type.cycle(),
+            9 => self.enabled = !self.enabled,
+            _ => {}
+        }
+    }
+    pub fn to_rule(&self) -> AutomationRule {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let id = self.original_id.clone()
+            .unwrap_or_else(|| format!("rule_{}", t.as_millis()));
+        AutomationRule {
+            id, name: self.name.clone(), enabled: self.enabled,
+            condition: crate::config::RuleCondition {
+                source: self.cond_source.clone(), field: self.cond_field.clone(),
+                op: self.cond_op.clone(), value: self.cond_value.clone(),
+            },
+            action: crate::config::RuleAction {
+                action_type: self.action_type.clone(), target: self.action_target.clone(),
+                value: self.action_value.clone(), field_kind: self.action_field_kind.clone(),
+            },
+            last_run: None, last_result: None,
+        }
+    }
+}
+
+// ── Onboarding form ───────────────────────────────────────────────────────────
+
+pub struct OnboardForm {
+    pub name: String,
+    pub email: String,
+    pub channel: String,
+    pub active: usize,
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    // Core
+    // ── Core ─────────────────────────────────────────────────────────────────
     pub screen: Screen,
     pub input_mode: InputMode,
     pub status: String,
@@ -185,6 +358,20 @@ pub struct App {
     pub faq: FaqManager,
     pub logger: ActivityLogger,
     pub profiles: ProfileManager,
+
+    // ── Track A: UX ──────────────────────────────────────────────────────────
+    pub show_help: bool,
+    pub show_palette: bool,
+    pub palette_input: String,
+    pub palette_sel: usize,
+    pub undo_stack: Vec<UndoAction>,
+
+    // ── Track G: Global search overlay ───────────────────────────────────────
+    pub gs_open: bool,
+    pub gs_input: String,
+    pub gs_results: Vec<SearchResult>,
+    pub gs_sel: usize,
+    pub gs_loading: bool,
 
     // ── Members screen ────────────────────────────────────────────────────────
     pub m_pages: Vec<Page>,
@@ -205,10 +392,20 @@ pub struct App {
     pub d_discord_members: Vec<crate::discord::Member>,
     pub d_members_list: ListState,
     pub d_sel: usize,
-    pub d_action_input: String,   // user_id for kick/ban
+    pub d_action_input: String,
     pub d_reason: String,
     pub d_active_field: usize,
-    pub d_section: usize,         // 0=invite 1=members 2=kick
+    pub d_section: usize, // 0=invite 1=members 2=kick/ban 3=roles 4=broadcast
+    // Track B additions
+    pub d_roles: Vec<Role>,
+    pub d_roles_list: ListState,
+    pub d_role_sel: usize,
+    pub d_assign_user: String,   // user_id for role assign/remove
+    pub d_broadcast_channel: String,
+    pub d_broadcast_msg: String,
+    pub d_dm_user: String,
+    pub d_dm_msg: String,
+    pub d_audit_log: Vec<AuditEntry>,
 
     // ── FAQ screen ────────────────────────────────────────────────────────────
     pub f_filtered: Vec<usize>,
@@ -242,7 +439,7 @@ pub struct App {
     pub s_sel: usize,
     pub s_form: Option<ProfileForm>,
 
-    // ── Database screen (generic, configurable) ─────────────────────────────
+    // ── Database screen ────────────────────────────────────────────────────────
     pub db_database_id: Option<String>,
     pub db_db_name: String,
     pub db_schema: Option<Schema>,
@@ -255,73 +452,110 @@ pub struct App {
     pub db_loading: bool,
     pub db_search: String,
     pub db_search_mode: bool,
-    // column configurator overlay
     pub db_cfg_sel: usize,
-    // database switcher overlay
     pub db_picker_input: String,
     pub db_picker_sel: usize,
     pub db_available: Vec<DbRef>,
-    // cell editor overlay
     pub db_edit_buf: String,
     pub db_edit_opt_idx: usize,
+    // Track C additions
+    pub db_page_body: String,
+    pub db_body_loading: bool,
+    pub db_body_append_buf: String,
+    pub db_filter_presets: Vec<FilterPreset>,
+    pub db_preset_sel: usize,
+    pub db_bulk_sel: HashSet<usize>,
+    pub db_bulk_mode: bool,
+
+    // ── Analytics screen (Track D) ─────────────────────────────────────────
+    pub an_summary: Option<AnalyticsSummary>,
+    pub an_loading: bool,
+    pub an_export_msg: String,
+
+    // ── Automation screen (Track F) ────────────────────────────────────────
+    pub auto_rules: Vec<AutomationRule>,
+    pub auto_list: ListState,
+    pub auto_sel: usize,
+    pub auto_form: Option<AutoRuleForm>,
+    pub auto_running: bool,
+    pub auto_last_result: String,
+    pub auto_onboard_form: Option<OnboardForm>,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let faq = FaqManager::load()?;
-        let logger = ActivityLogger::open()?;
+        let faq     = FaqManager::load()?;
+        let logger  = ActivityLogger::open()?;
         let profiles = ProfileManager::load()?;
 
+        let auto_rules = profiles.active()
+            .map(|p| p.automation_rules.clone())
+            .unwrap_or_default();
+
         let mut app = App {
-            screen: Screen::Dashboard,
-            input_mode: InputMode::Normal,
-            status: "Ready – press ? for help".into(),
-            should_quit: false,
+            screen: Screen::Dashboard, input_mode: InputMode::Normal,
+            status: "Ready – press ? for help\".into()" .into(), should_quit: false,
             tx, rx,
-            notion: None, discord: None,
-            faq, logger, profiles,
-            // members
+            notion: None, discord: None, faq, logger, profiles,
+            // UX
+            show_help: false, show_palette: false,
+            palette_input: String::new(), palette_sel: 0,
+            undo_stack: vec![],
+            // Global search
+            gs_open: false, gs_input: String::new(), gs_results: vec![],
+            gs_sel: 0, gs_loading: false,
+            // Members
             m_pages: vec![], m_schema: None,
             m_list: TableState::default(), m_sel: 0,
             m_search: String::new(), m_search_mode: false,
             m_form: None, m_loading: false,
-            // discord
+            // Discord
             d_channel: String::new(), d_hours: 24, d_uses: 1,
             d_invite_result: String::new(), d_user_query: String::new(),
             d_discord_members: vec![], d_members_list: ListState::default(),
             d_sel: 0, d_action_input: String::new(), d_reason: String::new(),
             d_active_field: 0, d_section: 0,
-            // faq
+            d_roles: vec![], d_roles_list: ListState::default(), d_role_sel: 0,
+            d_assign_user: String::new(),
+            d_broadcast_channel: String::new(), d_broadcast_msg: String::new(),
+            d_dm_user: String::new(), d_dm_msg: String::new(),
+            d_audit_log: vec![],
+            // FAQ
             f_filtered: vec![], f_list: ListState::default(), f_sel: 0,
             f_search: String::new(), f_search_mode: false,
             f_form: None, f_copied: false, f_show_preview: false,
-            // payments
+            // Payments
             p_search: String::new(), p_search_mode: false,
             p_results: vec![], p_res_list: TableState::default(), p_sel: 0,
             p_status_val: String::new(), p_notes: String::new(), p_active_field: 0,
-            // activity
+            // Activity
             a_logs: vec![], a_list: ListState::default(), a_sel: 0,
             a_filter: String::new(), a_filter_mode: false,
-            // settings
+            // Settings
             s_list: ListState::default(), s_sel: 0, s_form: None,
-            // database tab
+            // Database
             db_database_id: None, db_db_name: String::new(),
             db_schema: None, db_columns: vec![], db_rows: vec![],
             db_table: TableState::default(), db_row_sel: 0, db_col_sel: 0,
             db_mode: DbMode::Browse, db_loading: false,
             db_search: String::new(), db_search_mode: false,
-            db_cfg_sel: 0,
-            db_picker_input: String::new(), db_picker_sel: 0, db_available: vec![],
-            db_edit_buf: String::new(), db_edit_opt_idx: 0,
+            db_cfg_sel: 0, db_picker_input: String::new(), db_picker_sel: 0,
+            db_available: vec![], db_edit_buf: String::new(), db_edit_opt_idx: 0,
+            db_page_body: String::new(), db_body_loading: false,
+            db_body_append_buf: String::new(),
+            db_filter_presets: vec![], db_preset_sel: 0,
+            db_bulk_sel: HashSet::new(), db_bulk_mode: false,
+            // Analytics
+            an_summary: None, an_loading: false, an_export_msg: String::new(),
+            // Automation
+            auto_rules, auto_list: ListState::default(), auto_sel: 0,
+            auto_form: None, auto_running: false, auto_last_result: String::new(),
+            auto_onboard_form: None,
         };
-
-        // Try to load clients from active profile
         app.apply_active_profile();
-        // Refresh FAQ filter
         app.f_filtered = app.faq.filtered("");
         if !app.f_filtered.is_empty() { app.f_list.select(Some(0)); }
-
         Ok(app)
     }
 
@@ -335,15 +569,14 @@ impl App {
                     &p.discord_bot_token, &p.discord_guild_id, &p.discord_default_channel_id,
                 ));
             }
+            self.auto_rules = p.automation_rules.clone();
         }
     }
 
-    // ── Async event processing ────────────────────────────────────────────────
+    // ── Event processing ──────────────────────────────────────────────────────
 
     pub fn drain_events(&mut self) {
-        while let Ok(ev) = self.rx.try_recv() {
-            self.process(ev);
-        }
+        while let Ok(ev) = self.rx.try_recv() { self.process(ev); }
     }
 
     fn process(&mut self, ev: AppEvent) {
@@ -356,33 +589,29 @@ impl App {
                 self.status = format!("Loaded {} members", pages.len());
                 self.m_sel = 0;
                 if !pages.is_empty() { self.m_list.select(Some(0)); }
-                self.m_pages = pages;
-                self.m_loading = false;
+                self.m_pages = pages; self.m_loading = false;
                 let _ = self.logger.write("notion_query", "database", "members loaded", true);
             }
             AppEvent::MemberCreated(p) => {
                 self.status = format!("Added: {}", p.id);
-                self.m_form = None;
-                self.m_loading = false;
+                self.m_form = None; self.m_loading = false;
                 let _ = self.logger.write("notion_add", &p.id, "page created", true);
                 self.trigger_load_members();
             }
             AppEvent::MemberUpdated(p) => {
                 self.status = format!("Updated: {}", p.id);
-                self.m_form = None;
-                self.m_loading = false;
+                self.m_form = None; self.m_loading = false;
                 let _ = self.logger.write("notion_update", &p.id, "page updated", true);
                 self.trigger_load_members();
             }
             AppEvent::MemberRemoved => {
-                self.status = "Member removed".into();
-                self.m_loading = false;
+                self.status = "Member removed".into(); self.m_loading = false;
                 let _ = self.logger.write("notion_remove", "page", "archived", true);
                 self.trigger_load_members();
             }
             AppEvent::DiscordInvite(url) => {
                 self.d_invite_result = url.clone();
-                self.status = format!("Invite created: {url}");
+                self.status = format!("Invite: {url}");
                 let _ = self.logger.write("discord_invite", &url, "", true);
                 crate::faq::copy_to_clipboard(&url);
             }
@@ -392,6 +621,16 @@ impl App {
                 if !members.is_empty() { self.d_members_list.select(Some(0)); }
                 self.d_discord_members = members;
             }
+            AppEvent::DiscordRolesLoaded(roles) => {
+                self.status = format!("{} guild roles", roles.len());
+                self.d_role_sel = 0;
+                if !roles.is_empty() { self.d_roles_list.select(Some(0)); }
+                self.d_roles = roles;
+            }
+            AppEvent::DiscordAuditLoaded(entries) => {
+                self.status = format!("Audit log: {} entries", entries.len());
+                self.d_audit_log = entries;
+            }
             AppEvent::ActivityLoaded(logs) => {
                 self.a_sel = 0;
                 if !logs.is_empty() { self.a_list.select(Some(0)); }
@@ -400,167 +639,404 @@ impl App {
             AppEvent::StatusMsg(s) => self.status = s,
             AppEvent::ErrMsg(e) => {
                 self.status = format!("Error: {e}");
-                self.m_loading = false;
-                self.db_loading = false;
+                self.m_loading = false; self.db_loading = false;
+                self.gs_loading = false; self.an_loading = false;
+                self.auto_running = false;
             }
+            // Database tab
             AppEvent::DbSchemaLoaded(s) => {
-                // First time we see this database: build a default column
-                // layout (everything visible, in schema order). If a layout
-                // was already loaded from profiles.toml, keep it but append
-                // any schema properties it doesn't know about yet, so newly
-                // added Notion properties show up without losing the saved
-                // order/visibility/editable choices for existing ones.
                 if self.db_columns.is_empty() {
                     self.db_columns = s.props.iter().map(|p| ColumnConfig {
-                        property_name: p.name.clone(),
-                        visible: true,
-                        editable: p.editable,
+                        property_name: p.name.clone(), visible: true, editable: p.editable,
                     }).collect();
                 } else {
                     for p in &s.props {
                         if !self.db_columns.iter().any(|c| c.property_name == p.name) {
                             self.db_columns.push(ColumnConfig {
-                                property_name: p.name.clone(),
-                                visible: true,
-                                editable: p.editable,
+                                property_name: p.name.clone(), visible: true, editable: p.editable,
                             });
                         }
                     }
                 }
                 self.status = format!("Database schema: {} properties", s.props.len());
                 self.db_schema = Some(s);
+                // Refresh filter presets from profile
+                if let (Some(db_id), Some(p)) = (&self.db_database_id, self.profiles.active()) {
+                    self.db_filter_presets = p.database_tab.filter_presets
+                        .get(db_id).cloned().unwrap_or_default();
+                }
             }
             AppEvent::DbRowsLoaded(rows) => {
                 self.status = format!("Loaded {} rows", rows.len());
-                self.db_row_sel = 0;
-                if !rows.is_empty() { self.db_table.select(Some(0)); } else { self.db_table.select(None); }
-                self.db_rows = rows;
-                self.db_loading = false;
+                self.db_row_sel = 0; self.db_bulk_sel.clear();
+                if !rows.is_empty() { self.db_table.select(Some(0)); }
+                else { self.db_table.select(None); }
+                self.db_rows = rows; self.db_loading = false;
             }
             AppEvent::DbDatabasesListed(dbs) => {
                 self.status = format!("Found {} databases", dbs.len());
-                self.db_picker_sel = 0;
-                self.db_available = dbs;
+                self.db_picker_sel = 0; self.db_available = dbs;
             }
             AppEvent::DbRowUpdated(p) => {
                 self.status = format!("Row updated: {}", p.id);
                 self.trigger_db_load_rows();
+            }
+            AppEvent::DbPageBodyLoaded(body) => {
+                self.db_page_body = body;
+                self.db_body_loading = false;
+                self.status = "Page body loaded.".into();
+            }
+            // Analytics
+            AppEvent::AnalyticsSummaryLoaded(s) => {
+                self.an_summary = Some(s); self.an_loading = false;
+                self.status = "Analytics refreshed.".into();
+            }
+            // Automation
+            AppEvent::AutomationRuleResult { rule_id, result } => {
+                self.auto_last_result = format!("[{rule_id}] {result}");
+                self.auto_running = false;
+                let _ = self.logger.write("automation_rule", &rule_id, &result, true);
+                // Persist last_result into the rule
+                let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                if let Some(r) = self.auto_rules.iter_mut().find(|r| r.id == rule_id) {
+                    r.last_run = Some(ts); r.last_result = Some(result);
+                }
+                self.save_automation_rules();
+            }
+            // Global search
+            AppEvent::GlobalSearchResults(mut results) => {
+                self.gs_results.append(&mut results);
+                self.gs_loading = self.gs_loading; // last batch sets to false externally
+                self.gs_loading = false;
+                self.status = format!("Found {} result(s)", self.gs_results.len());
             }
         }
     }
 
     // ── Spawn helpers ─────────────────────────────────────────────────────────
 
-    fn trigger_load_members(&mut self) {
-        if let Some(n) = self.notion.clone() {
-            self.m_loading = true;
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match n.query(None).await {
-                    Ok(p) => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        } else {
-            self.status = "No Notion profile active. Go to Settings (7).".into();
-        }
+    pub fn trigger_load_members(&mut self) {
+        let Some(n) = self.notion.clone() else {
+            self.status = "No Notion profile. Configure in Settings (7).".into();
+            return;
+        };
+        self.m_loading = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.query(None).await {
+                Ok(p)  => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     fn trigger_load_schema(&mut self) {
-        if let Some(n) = self.notion.clone() {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match n.fetch_schema().await {
-                    Ok(s) => { let _ = tx.send(AppEvent::SchemaLoaded(s)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        }
+        let Some(n) = self.notion.clone() else { return; };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.fetch_schema().await {
+                Ok(s)  => { let _ = tx.send(AppEvent::SchemaLoaded(s)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     fn trigger_load_activity(&mut self) {
         match self.logger.recent(200) {
             Ok(logs) => { let _ = self.tx.send(AppEvent::ActivityLoaded(logs)); }
-            Err(e) => self.status = format!("Log error: {e}"),
+            Err(e)   => self.status = format!("Log error: {e}"),
         }
     }
 
     fn trigger_discord_invite(&mut self) {
-        if let Some(d) = self.discord.clone() {
-            let ch = self.d_channel.clone();
-            let h = self.d_hours;
-            let u = self.d_uses;
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match d.create_invite(&ch, h, u).await {
-                    Ok(inv) => { let _ = tx.send(AppEvent::DiscordInvite(inv.url)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        } else {
+        let Some(d) = self.discord.clone() else {
             self.status = "No Discord profile. Configure in Settings (7).".into();
-        }
+            return;
+        };
+        let (ch, h, u) = (self.d_channel.clone(), self.d_hours, self.d_uses);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match d.create_invite(&ch, h, u).await {
+                Ok(inv) => { let _ = tx.send(AppEvent::DiscordInvite(inv.url)); }
+                Err(e)  => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     fn trigger_discord_members(&mut self) {
-        if let Some(d) = self.discord.clone() {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match d.get_members(100).await {
-                    Ok(m) => { let _ = tx.send(AppEvent::DiscordMembersLoaded(m)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        }
+        let Some(d) = self.discord.clone() else { return; };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match d.get_members(100).await {
+                Ok(m)  => { let _ = tx.send(AppEvent::DiscordMembersLoaded(m)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    fn trigger_discord_roles(&mut self) {
+        let Some(d) = self.discord.clone() else { return; };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match d.list_roles().await {
+                Ok(r)  => { let _ = tx.send(AppEvent::DiscordRolesLoaded(r)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    fn trigger_discord_audit(&mut self) {
+        let Some(d) = self.discord.clone() else { return; };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match d.get_audit_log(50).await {
+                Ok(a)  => { let _ = tx.send(AppEvent::DiscordAuditLoaded(a)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     // ── Database tab spawn helpers ────────────────────────────────────────────
 
     fn trigger_db_load_schema(&mut self) {
-        if let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match n.fetch_schema_of(&db_id).await {
-                    Ok(s) => { let _ = tx.send(AppEvent::DbSchemaLoaded(s)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        } else {
-            self.status = "No Notion profile active. Go to Settings (7).".into();
-        }
+        let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) else {
+            self.status = "No Notion profile. Configure in Settings (7).".into();
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.fetch_schema_of(&db_id).await {
+                Ok(s)  => { let _ = tx.send(AppEvent::DbSchemaLoaded(s)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     fn trigger_db_load_rows(&mut self) {
-        if let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) {
-            self.db_loading = true;
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match n.query_of(&db_id, None).await {
-                    Ok(p) => { let _ = tx.send(AppEvent::DbRowsLoaded(p)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        }
+        let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) else { return; };
+        self.db_loading = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.query_of(&db_id, None).await {
+                Ok(p)  => { let _ = tx.send(AppEvent::DbRowsLoaded(p)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
     }
 
     fn trigger_db_list_databases(&mut self) {
-        if let Some(n) = self.notion.clone() {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                match n.list_databases().await {
-                    Ok(dbs) => { let _ = tx.send(AppEvent::DbDatabasesListed(dbs)); }
-                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                }
-            });
-        } else {
-            self.status = "No Notion profile active. Go to Settings (7).".into();
+        let Some(n) = self.notion.clone() else {
+            self.status = "No Notion profile. Configure in Settings (7).".into();
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.list_databases().await {
+                Ok(dbs) => { let _ = tx.send(AppEvent::DbDatabasesListed(dbs)); }
+                Err(e)  => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    fn trigger_db_page_body(&mut self) {
+        let Some(page) = self.db_rows.get(self.db_row_sel).cloned() else { return; };
+        let Some(n) = self.notion.clone() else { return; };
+        self.db_body_loading = true;
+        let tx = self.tx.clone();
+        let pid = page.id.clone();
+        tokio::spawn(async move {
+            match n.fetch_page_body(&pid).await {
+                Ok(body) => { let _ = tx.send(AppEvent::DbPageBodyLoaded(body)); }
+                Err(e)   => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    fn trigger_db_load_rows_filtered(&mut self, filter: serde_json::Value) {
+        let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) else { return; };
+        self.db_loading = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match n.query_of(&db_id, Some(filter)).await {
+                Ok(p)  => { let _ = tx.send(AppEvent::DbRowsLoaded(p)); }
+                Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    // ── Analytics spawn helpers ───────────────────────────────────────────────
+
+    fn trigger_analytics(&mut self) {
+        self.an_loading = true;
+        match self.logger.analytics_summary() {
+            Ok(s)  => { let _ = self.tx.send(AppEvent::AnalyticsSummaryLoaded(s)); }
+            Err(e) => { self.status = format!("Analytics error: {e}"); self.an_loading = false; }
         }
     }
 
-    /// Default the Database tab to the profile's saved active database (or
-    /// the Members database if none was saved yet), and load that
-    /// database's saved column layout. Idempotent — only runs once until
-    /// `switch_database` clears `db_database_id` again.
+    fn trigger_export_csv(&mut self) {
+        match self.logger.export_log_csv(1000) {
+            Ok(csv) => {
+                let path = "/tmp/theblackroom_export.csv";
+                match std::fs::write(path, csv) {
+                    Ok(_)  => self.an_export_msg = format!("Exported to {path}"),
+                    Err(e) => self.an_export_msg = format!("Export failed: {e}"),
+                }
+            }
+            Err(e) => self.an_export_msg = format!("Export error: {e}"),
+        }
+    }
+
+    // ── Automation spawn helpers ──────────────────────────────────────────────
+
+    fn trigger_run_rule(&mut self, rule: AutomationRule) {
+        let (Some(n), Some(d)) = (self.notion.clone(), self.discord.clone()) else {
+            self.status = "Automation needs both Notion and Discord configured.".into();
+            return;
+        };
+        self.auto_running = true;
+        let tx = self.tx.clone();
+        let rule_id = rule.id.clone();
+        tokio::spawn(async move {
+            let result = crate::automation::run_rule(&rule, &n, &d).await;
+            let _ = tx.send(AppEvent::AutomationRuleResult { rule_id, result });
+        });
+    }
+
+    fn trigger_onboarding(&mut self, name: String, email: String, channel: String) {
+        let (Some(n), Some(d)) = (self.notion.clone(), self.discord.clone()) else {
+            self.status = "Onboarding needs both Notion and Discord configured.".into();
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match crate::automation::run_onboarding(&n, &d, &name, &email, &channel).await {
+                Ok(msg)  => { let _ = tx.send(AppEvent::StatusMsg(format!("Onboarding: {msg}"))); }
+                Err(e)   => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+            }
+        });
+    }
+
+    fn save_automation_rules(&mut self) {
+        let rules = self.auto_rules.clone();
+        if let Some(p) = self.profiles.profiles.get_mut(self.profiles.active_idx) {
+            p.automation_rules = rules;
+        }
+        let _ = self.profiles.save();
+    }
+
+    // ── Global search spawn (Track G) ────────────────────────────────────────
+
+    pub fn trigger_global_search(&mut self) {
+        let query = self.gs_input.clone();
+        if query.is_empty() { return; }
+        self.gs_results.clear();
+        self.gs_loading = true;
+        self.gs_sel = 0;
+
+        // 1. Notion
+        if let Some(n) = self.notion.clone() {
+            let tx = self.tx.clone();
+            let q = query.clone();
+            tokio::spawn(async move {
+                if let Ok(pages) = n.search_global(&q).await {
+                    let results = pages.into_iter().map(|p| {
+                        let title = p.title();
+                        SearchResult {
+                            source: SearchSource::Notion,
+                            id: p.id.clone(),
+                            title: if title.is_empty() { p.id.clone() } else { title },
+                            preview: String::new(),
+                        }
+                    }).collect();
+                    let _ = tx.send(AppEvent::GlobalSearchResults(results));
+                }
+            });
+        }
+
+        // 2. Discord members
+        if let Some(d) = self.discord.clone() {
+            let tx = self.tx.clone();
+            let q = query.clone();
+            tokio::spawn(async move {
+                if let Ok(members) = d.search_members(&q).await {
+                    let results = members.into_iter().map(|m| SearchResult {
+                        source: SearchSource::Discord,
+                        id: m.user_id.clone(),
+                        title: format!("{} (@{})", m.display, m.username),
+                        preview: format!("Joined: {}", m.joined_at),
+                    }).collect();
+                    let _ = tx.send(AppEvent::GlobalSearchResults(results));
+                }
+            });
+        }
+
+        // 3. FAQ snippets (local)
+        {
+            let q_lower = query.to_lowercase();
+            let faq_results: Vec<SearchResult> = self.faq.snippets.iter()
+                .filter(|s| s.title.to_lowercase().contains(&q_lower)
+                         || s.content.to_lowercase().contains(&q_lower))
+                .map(|s| SearchResult {
+                    source: SearchSource::Faq,
+                    id: s.id.clone(),
+                    title: s.title.clone(),
+                    preview: s.content.chars().take(60).collect(),
+                })
+                .collect();
+            if !faq_results.is_empty() {
+                let _ = self.tx.send(AppEvent::GlobalSearchResults(faq_results));
+            }
+        }
+
+        // 4. Activity log (local)
+        {
+            let q_lower = query.to_lowercase();
+            if let Ok(log_results) = self.logger.search(&q_lower) {
+                let results: Vec<SearchResult> = log_results.into_iter().map(|e| SearchResult {
+                    source: SearchSource::Activity,
+                    id: e.id.to_string(),
+                    title: format!("{} – {}", e.kind, e.target),
+                    preview: format!("{}: {}", e.ts, e.detail),
+                }).collect();
+                if !results.is_empty() {
+                    let _ = self.tx.send(AppEvent::GlobalSearchResults(results));
+                }
+            }
+        }
+    }
+
+    // ── Database tab helpers ──────────────────────────────────────────────────
+
+    pub fn db_visible_columns(&self) -> Vec<&ColumnConfig> {
+        self.db_columns.iter().filter(|c| c.visible).collect()
+    }
+
+    pub fn db_edit_kind(&self) -> Option<String> {
+        let cols = self.db_visible_columns();
+        let col = cols.get(self.db_col_sel)?;
+        self.db_schema.as_ref()?.props.iter()
+            .find(|p| p.name == col.property_name)
+            .map(|p| p.kind.clone())
+    }
+
+    pub fn db_edit_options(&self) -> Vec<String> {
+        let cols = self.db_visible_columns();
+        cols.get(self.db_col_sel)
+            .and_then(|col| self.db_schema.as_ref()?.props.iter()
+                .find(|p| p.name == col.property_name))
+            .map(|p| p.options.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn db_filtered_indices(&self) -> Vec<usize> {
+        let q = self.db_picker_input.to_lowercase();
+        self.db_available.iter().enumerate()
+            .filter(|(_, d)| q.is_empty() || d.title.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn ensure_db_tab_initialized(&mut self) {
         if self.db_database_id.is_some() { return; }
         if let Some(p) = self.profiles.active() {
@@ -574,18 +1050,14 @@ impl App {
         }
     }
 
-    /// Point the Database tab at a different database: saves the current
-    /// column layout to the still-active profile first (so it isn't lost),
-    /// then resets and reloads for the new database.
     fn switch_database(&mut self, id: String, title: String) {
         self.save_db_config();
         self.db_database_id = Some(id.clone());
         self.db_db_name = title;
-        self.db_schema = None;
-        self.db_rows = vec![];
-        self.db_row_sel = 0;
-        self.db_col_sel = 0;
+        self.db_schema = None; self.db_rows = vec![];
+        self.db_row_sel = 0; self.db_col_sel = 0;
         self.db_table = TableState::default();
+        self.db_bulk_sel.clear();
         self.db_columns = self.profiles.active()
             .and_then(|p| p.database_tab.columns.get(&id).cloned())
             .unwrap_or_default();
@@ -594,88 +1066,145 @@ impl App {
         self.trigger_db_load_rows();
     }
 
-    /// Persist the current column layout (visibility/order/editable) for the
-    /// active database into the active profile's profiles.toml.
     fn save_db_config(&mut self) {
-        let Some(db_id) = self.db_database_id.clone() else { return };
+        let Some(db_id) = self.db_database_id.clone() else { return; };
         if let Some(profile) = self.profiles.profiles.get_mut(self.profiles.active_idx) {
             profile.database_tab.active_database_id = Some(db_id.clone());
-            profile.database_tab.columns.insert(db_id, self.db_columns.clone());
-        } else {
-            return;
-        }
+            profile.database_tab.columns.insert(db_id.clone(), self.db_columns.clone());
+            profile.database_tab.filter_presets.insert(db_id, self.db_filter_presets.clone());
+        } else { return; }
         match self.profiles.save() {
-            Ok(_) => self.status = "Column layout saved.".into(),
+            Ok(_)  => self.status = "Column layout saved.".into(),
             Err(e) => self.status = format!("Save error: {e}"),
         }
     }
 
-    // ── Database tab helpers (used by both app.rs and ui/screens.rs) ─────────
+    // ── Palette helpers ───────────────────────────────────────────────────────
 
-    pub fn db_visible_columns(&self) -> Vec<&ColumnConfig> {
-        self.db_columns.iter().filter(|c| c.visible).collect()
-    }
-
-    /// Notion property kind ("select", "checkbox", "rich_text", …) for the
-    /// currently selected visible column, looked up from the loaded schema.
-    pub fn db_edit_kind(&self) -> Option<String> {
-        let cols = self.db_visible_columns();
-        let col = cols.get(self.db_col_sel)?;
-        self.db_schema.as_ref()?.props.iter()
-            .find(|p| p.name == col.property_name)
-            .map(|p| p.kind.clone())
-    }
-
-    /// Select/status options for the currently selected visible column.
-    pub fn db_edit_options(&self) -> Vec<String> {
-        let cols = self.db_visible_columns();
-        cols.get(self.db_col_sel)
-            .and_then(|col| self.db_schema.as_ref()?.props.iter().find(|p| p.name == col.property_name))
-            .map(|p| p.options.clone())
-            .unwrap_or_default()
-    }
-
-    /// Indices into `db_available` matching the current picker filter text.
-    pub fn db_filtered_indices(&self) -> Vec<usize> {
-        let q = self.db_picker_input.to_lowercase();
-        self.db_available.iter().enumerate()
-            .filter(|(_, d)| q.is_empty() || d.title.to_lowercase().contains(&q))
+    pub fn palette_filtered(&self) -> Vec<usize> {
+        let q = self.palette_input.to_lowercase();
+        PALETTE_CMDS.iter().enumerate()
+            .filter(|(_, c)| q.is_empty()
+                || c.keys.contains(&q as &str)
+                || c.label.to_lowercase().contains(&q)
+                || c.description.to_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect()
     }
 
+    fn execute_palette_cmd(&mut self, label: &str) {
+        match label {
+            "Dashboard"      => { self.screen = Screen::Dashboard; }
+            "Members"        => { self.screen = Screen::Members; if self.m_schema.is_none() { self.trigger_load_schema(); } }
+            "Discord"        => { self.screen = Screen::Discord; }
+            "FAQ"            => { self.screen = Screen::Faq; }
+            "Payments"       => { self.screen = Screen::Payments; }
+            "Activity Log"   => { self.screen = Screen::Activity; self.trigger_load_activity(); }
+            "Settings"       => { self.screen = Screen::Settings; }
+            "Database"       => { self.screen = Screen::Database; self.ensure_db_tab_initialized(); }
+            "Analytics"      => { self.screen = Screen::Analytics; self.trigger_analytics(); }
+            "Automation"     => { self.screen = Screen::Automation; }
+            "Global Search"  => { self.show_palette = false; self.gs_open = true; self.input_mode = InputMode::Editing; }
+            "Refresh"        => self.refresh_current_screen(),
+            "Export CSV"     => self.trigger_export_csv(),
+            "Onboard Member" => { self.screen = Screen::Automation; self.auto_onboard_form = Some(OnboardForm { name: String::new(), email: String::new(), channel: String::new(), active: 0 }); self.input_mode = InputMode::Editing; }
+            "Run All Rules"  => self.trigger_run_all_rules(),
+            "Quit"           => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    fn refresh_current_screen(&mut self) {
+        match self.screen {
+            Screen::Members  => self.trigger_load_members(),
+            Screen::Activity => self.trigger_load_activity(),
+            Screen::Database => self.trigger_db_load_rows(),
+            Screen::Analytics => self.trigger_analytics(),
+            Screen::Discord  => {
+                if self.d_section == 1 { self.trigger_discord_members(); }
+                else if self.d_section == 3 { self.trigger_discord_roles(); }
+            }
+            _ => {}
+        }
+    }
+
+    fn trigger_run_all_rules(&mut self) {
+        for rule in self.auto_rules.clone() {
+            if rule.enabled { self.trigger_run_rule(rule); }
+        }
+    }
+
     // ── Key handling ──────────────────────────────────────────────────────────
 
-    /// Returns true → quit.
     pub async fn handle_key(&mut self, key: KeyEvent) -> bool {
-        // Close any active form with Esc
+        // Global search overlay
+        if self.gs_open {
+            self.handle_global_search_key(key);
+            return false;
+        }
+
+        // Command palette overlay
+        if self.show_palette {
+            self.handle_palette_key(key);
+            return false;
+        }
+
+        // Help overlay dismiss
+        if self.show_help {
+            self.show_help = false;
+            return false;
+        }
+
+        // Esc: close forms / modes
         if key.code == KeyCode::Esc {
             if self.m_form.is_some() { self.m_form = None; self.input_mode = InputMode::Normal; return false; }
             if self.f_form.is_some() { self.f_form = None; self.input_mode = InputMode::Normal; return false; }
             if self.s_form.is_some() { self.s_form = None; self.input_mode = InputMode::Normal; return false; }
+            if self.auto_form.is_some() { self.auto_form = None; self.input_mode = InputMode::Normal; return false; }
+            if self.auto_onboard_form.is_some() { self.auto_onboard_form = None; self.input_mode = InputMode::Normal; return false; }
             if self.db_mode != DbMode::Browse {
-                self.db_mode = DbMode::Browse;
-                self.input_mode = InputMode::Normal;
-                return false;
+                self.db_mode = DbMode::Browse; self.input_mode = InputMode::Normal; return false;
             }
             if self.input_mode == InputMode::Editing {
                 self.input_mode = InputMode::Normal;
-                self.m_search_mode = false;
-                self.f_search_mode = false;
-                self.a_filter_mode = false;
-                self.p_search_mode = false;
+                self.m_search_mode = false; self.f_search_mode = false;
+                self.a_filter_mode = false; self.p_search_mode = false;
                 self.db_search_mode = false;
                 return false;
             }
         }
 
-        // In editing mode, route to the active screen's text handler
+        // Editing mode: route to current screen's text handler
         if self.input_mode == InputMode::Editing {
             self.handle_editing(key);
             return false;
         }
 
-        // Global screen switches (1-7)
+        // Ctrl+Z: undo
+        if key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL {
+            self.handle_undo();
+            return false;
+        }
+
+        // Global overlays
+        match key.code {
+            KeyCode::Char('?') => { self.show_help = true; return false; }
+            KeyCode::Char(':') => {
+                self.show_palette = true;
+                self.palette_input.clear();
+                self.palette_sel = 0;
+                self.input_mode = InputMode::Editing;
+                return false;
+            }
+            KeyCode::Char('`') => {
+                self.gs_open = !self.gs_open;
+                if self.gs_open { self.gs_input.clear(); self.gs_results.clear(); self.gs_sel = 0; self.input_mode = InputMode::Editing; }
+                return false;
+            }
+            _ => {}
+        }
+
+        // Screen switches
         match key.code {
             KeyCode::Char('1') => { self.screen = Screen::Dashboard; return false; }
             KeyCode::Char('2') => {
@@ -696,6 +1225,12 @@ impl App {
                 if self.db_rows.is_empty() { self.trigger_db_load_rows(); }
                 return false;
             }
+            KeyCode::Char('9') => {
+                self.screen = Screen::Analytics;
+                if self.an_summary.is_none() { self.trigger_analytics(); }
+                return false;
+            }
+            KeyCode::Char('0') => { self.screen = Screen::Automation; return false; }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT {
                     return true;
@@ -706,45 +1241,114 @@ impl App {
 
         // Per-screen keys
         match self.screen.clone() {
-            Screen::Members  => self.key_members(key).await,
-            Screen::Discord  => self.key_discord(key).await,
-            Screen::Faq      => self.key_faq(key),
-            Screen::Payments => self.key_payments(key).await,
-            Screen::Activity => self.key_activity(key),
-            Screen::Settings => self.key_settings(key),
-            Screen::Database => self.key_database(key),
-            Screen::Dashboard => {}
+            Screen::Members    => self.key_members(key).await,
+            Screen::Discord    => self.key_discord(key).await,
+            Screen::Faq        => self.key_faq(key),
+            Screen::Payments   => self.key_payments(key).await,
+            Screen::Activity   => self.key_activity(key),
+            Screen::Settings   => self.key_settings(key),
+            Screen::Database   => self.key_database(key),
+            Screen::Analytics  => self.key_analytics(key),
+            Screen::Automation => self.key_automation(key).await,
+            Screen::Dashboard  => {}
         }
         false
     }
 
-    // ── Editing mode (text input routing) ─────────────────────────────────────
+    // ── Undo ──────────────────────────────────────────────────────────────────
+
+    fn handle_undo(&mut self) {
+        let Some(action) = self.undo_stack.pop() else {
+            self.status = "Nothing to undo.".into();
+            return;
+        };
+        match action {
+            UndoAction::UpdatePage { page_id, old_props } => {
+                if let Some(n) = self.notion.clone() {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        match n.update_page(&page_id, old_props).await {
+                            Ok(p)  => { let _ = tx.send(AppEvent::DbRowUpdated(p)); }
+                            Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+                        }
+                    });
+                    self.status = "Undoing last cell update…".into();
+                }
+            }
+            UndoAction::CreatePage { page_id } => {
+                if let Some(n) = self.notion.clone() {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        match n.archive_page(&page_id).await {
+                            Ok(_)  => { let _ = tx.send(AppEvent::MemberRemoved); }
+                            Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+                        }
+                    });
+                    self.status = "Undoing create – archiving page…".into();
+                }
+            }
+        }
+    }
+
+    // ── Editing mode routing ──────────────────────────────────────────────────
 
     fn handle_editing(&mut self, key: KeyEvent) {
-        // The Database tab's EditCell and SwitchDatabase modes need
-        // immediate Left/Right/Up/Down handling (live select-cycling, live
-        // list navigation while typing a filter) rather than the generic
-        // text-field router below, which only reacts to Tab/Char/Backspace/
-        // Enter and defers everything else to the per-screen key handler —
-        // a handler that, by construction, is never reached while
-        // `input_mode == Editing` (see `handle_key` above).
+        // Command palette receives keys while show_palette = true
+        if self.show_palette {
+            match key.code {
+                KeyCode::Esc => { self.show_palette = false; self.input_mode = InputMode::Normal; }
+                KeyCode::Down => {
+                    let n = self.palette_filtered().len();
+                    if self.palette_sel + 1 < n { self.palette_sel += 1; }
+                }
+                KeyCode::Up => { if self.palette_sel > 0 { self.palette_sel -= 1; } }
+                KeyCode::Enter => {
+                    let filtered = self.palette_filtered();
+                    if let Some(&idx) = filtered.get(self.palette_sel) {
+                        let label = PALETTE_CMDS[idx].label;
+                        self.show_palette = false;
+                        self.input_mode = InputMode::Normal;
+                        self.execute_palette_cmd(label);
+                    }
+                }
+                KeyCode::Char(c) => { self.palette_input.push(c); self.palette_sel = 0; }
+                KeyCode::Backspace => { self.palette_input.pop(); self.palette_sel = 0; }
+                _ => {}
+            }
+            return;
+        }
+
+        // Database special modes
         if self.screen == Screen::Database {
             match self.db_mode {
-                DbMode::EditCell => { self.handle_db_edit_cell_key(key); return; }
+                DbMode::EditCell      => { self.handle_db_edit_cell_key(key); return; }
                 DbMode::SwitchDatabase => { self.handle_db_switch_key(key); return; }
+                DbMode::ViewBody      => { self.handle_db_body_key(key); return; }
+                DbMode::FilterPresets => { self.handle_db_preset_key(key); return; }
                 _ => {}
             }
         }
+
+        // Automation onboarding form
+        if self.auto_onboard_form.is_some() {
+            self.handle_onboard_editing(key);
+            return;
+        }
+
+        // Automation rule form
+        if self.auto_form.is_some() {
+            self.handle_auto_form_editing(key);
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
-                self.m_search_mode = false;
-                self.f_search_mode = false;
-                self.a_filter_mode = false;
-                self.p_search_mode = false;
+                self.m_search_mode = false; self.f_search_mode = false;
+                self.a_filter_mode = false; self.p_search_mode = false;
+                self.db_search_mode = false;
             }
             KeyCode::Tab => {
-                // advance active field inside forms
                 if let Some(form) = &mut self.m_form {
                     form.active = (form.active + 1) % form.fields.len().max(1);
                 } else if let Some(form) = &mut self.f_form {
@@ -752,7 +1356,11 @@ impl App {
                 } else if let Some(form) = &mut self.s_form {
                     form.active = (form.active + 1) % 6;
                 } else if self.screen == Screen::Discord {
-                    self.d_active_field = (self.d_active_field + 1) % 5;
+                    // Section-aware Tab
+                    let max = match self.d_section {
+                        0 => 2, 2 => 2, 3 => 2, 4 => 2, _ => 1,
+                    };
+                    self.d_active_field = (self.d_active_field + 1) % max;
                 } else if self.screen == Screen::Payments {
                     self.p_active_field = (self.p_active_field + 1) % 3;
                 }
@@ -764,18 +1372,99 @@ impl App {
                     if form.active > 0 { form.active -= 1; }
                 } else if let Some(form) = &mut self.s_form {
                     if form.active > 0 { form.active -= 1; }
-                } else if self.screen == Screen::Discord {
-                    if self.d_active_field > 0 { self.d_active_field -= 1; }
-                } else if self.screen == Screen::Payments {
-                    if self.p_active_field > 0 { self.p_active_field -= 1; }
                 }
             }
             KeyCode::Char(c) => self.editing_char(c),
             KeyCode::Backspace => self.editing_backspace(),
-            KeyCode::Enter => {
-                // Confirm form or search
+            KeyCode::Enter => { self.input_mode = InputMode::Normal; }
+            _ => {}
+        }
+    }
+
+    fn handle_auto_form_editing(&mut self, key: KeyEvent) {
+        let n_fields = AutoRuleForm::field_count();
+        match key.code {
+            KeyCode::Esc => { self.auto_form = None; self.input_mode = InputMode::Normal; }
+            KeyCode::Tab => {
+                if let Some(f) = &mut self.auto_form {
+                    f.active = (f.active + 1) % n_fields;
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(f) = &mut self.auto_form {
+                    if f.active > 0 { f.active -= 1; }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(f) = &mut self.auto_form { f.cycle_left(f.active); }
+            }
+            KeyCode::Right => {
+                if let Some(f) = &mut self.auto_form { f.cycle_left(f.active); }
+            }
+            KeyCode::Backspace => {
+                if let Some(f) = &mut self.auto_form {
+                    let ai = f.active;
+                    if let Some(buf) = f.field_value_mut(ai) { buf.pop(); }
+                }
+            }
+            // Save – must appear BEFORE the general Char(c) arm
+            KeyCode::F(2) | KeyCode::Char('s') => {
+                if let Some(f) = &self.auto_form {
+                    let rule = f.to_rule();
+                    let id = rule.id.clone();
+                    match self.auto_rules.iter().position(|r| r.id == id) {
+                        Some(i) => self.auto_rules[i] = rule,
+                        None    => self.auto_rules.push(rule),
+                    }
+                    self.save_automation_rules();
+                    self.status = "Rule saved.".into();
+                }
+                self.auto_form = None;
                 self.input_mode = InputMode::Normal;
-                // screens handle the submit separately via their own Enter logic
+            }
+            KeyCode::Char(c) => {
+                if let Some(f) = &mut self.auto_form {
+                    let ai = f.active;
+                    if let Some(buf) = f.field_value_mut(ai) { buf.push(c); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_onboard_editing(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => { self.auto_onboard_form = None; self.input_mode = InputMode::Normal; }
+            KeyCode::Tab => {
+                if let Some(f) = &mut self.auto_onboard_form {
+                    f.active = (f.active + 1) % 3;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(f) = &mut self.auto_onboard_form {
+                    match f.active {
+                        0 => f.name.push(c),
+                        1 => f.email.push(c),
+                        _ => f.channel.push(c),
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(f) = &mut self.auto_onboard_form {
+                    match f.active {
+                        0 => { f.name.pop(); }
+                        1 => { f.email.pop(); }
+                        _ => { f.channel.pop(); }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(f) = &self.auto_onboard_form {
+                    let (name, email, ch) = (f.name.clone(), f.email.clone(), f.channel.clone());
+                    self.auto_onboard_form = None;
+                    self.input_mode = InputMode::Normal;
+                    self.trigger_onboarding(name, email, ch);
+                }
             }
             _ => {}
         }
@@ -787,14 +1476,13 @@ impl App {
         if self.a_filter_mode { return Some(&mut self.a_filter); }
         if self.p_search_mode { return Some(&mut self.p_search); }
         if self.db_search_mode { return Some(&mut self.db_search); }
+        if self.gs_open { return Some(&mut self.gs_input); }
         if let Some(form) = &mut self.m_form {
             return form.fields.get_mut(form.active).map(|f| &mut f.value);
         }
         if let Some(form) = &mut self.f_form {
             return match form.active {
-                0 => Some(&mut form.title),
-                1 => Some(&mut form.content),
-                _ => Some(&mut form.tags),
+                0 => Some(&mut form.title), 1 => Some(&mut form.content), _ => Some(&mut form.tags),
             };
         }
         if let Some(form) = &mut self.s_form {
@@ -802,11 +1490,11 @@ impl App {
             return form.field_value_mut(idx);
         }
         match self.screen {
-            Screen::Discord => match self.d_active_field {
+            Screen::Discord => match self.d_section {
                 0 => Some(&mut self.d_channel),
-                2 => Some(&mut self.d_user_query),
-                3 => Some(&mut self.d_action_input),
-                4 => Some(&mut self.d_reason),
+                2 => Some(&mut self.d_action_input),
+                3 => Some(&mut self.d_assign_user),
+                4 => Some(&mut self.d_broadcast_msg),
                 _ => None,
             },
             Screen::Payments => match self.p_active_field {
@@ -819,20 +1507,19 @@ impl App {
     }
 
     fn editing_char(&mut self, c: char) {
-        // For select fields in member form, cycle options instead of typing
         if let Some(form) = &mut self.m_form {
             let f = &mut form.fields[form.active];
-            if (f.kind == "select" || f.kind == "multi_select" || f.kind == "status") && !f.options.is_empty() {
-                return; // handled by left/right
+            if matches!(f.kind.as_str(), "select" | "multi_select" | "status") && !f.options.is_empty() {
+                return;
             }
         }
         if let Some(buf) = self.active_buf() { buf.push(c); }
-        // Live-update FAQ filter
         if self.f_search_mode {
             let q = self.f_search.clone();
             self.f_filtered = self.faq.filtered(&q);
             self.f_sel = 0;
-            if !self.f_filtered.is_empty() { self.f_list.select(Some(0)); } else { self.f_list.select(None); }
+            if !self.f_filtered.is_empty() { self.f_list.select(Some(0)); }
+            else { self.f_list.select(None); }
         }
     }
 
@@ -842,11 +1529,53 @@ impl App {
             let q = self.f_search.clone();
             self.f_filtered = self.faq.filtered(&q);
             self.f_sel = 0;
-            if !self.f_filtered.is_empty() { self.f_list.select(Some(0)); } else { self.f_list.select(None); }
+            if !self.f_filtered.is_empty() { self.f_list.select(Some(0)); }
+            else { self.f_list.select(None); }
         }
     }
 
-    // ── Database tab: EditCell overlay key handling ───────────────────────────
+    // ── Global search key handler ─────────────────────────────────────────────
+
+    fn handle_global_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => { self.gs_open = false; self.input_mode = InputMode::Normal; }
+            KeyCode::Char(c) => {
+                self.gs_input.push(c);
+                self.gs_results.clear(); self.gs_sel = 0;
+                self.trigger_global_search();
+            }
+            KeyCode::Backspace => {
+                self.gs_input.pop();
+                if self.gs_input.is_empty() { self.gs_results.clear(); self.gs_loading = false; }
+                else { self.gs_results.clear(); self.trigger_global_search(); }
+            }
+            KeyCode::Down => {
+                if self.gs_sel + 1 < self.gs_results.len() { self.gs_sel += 1; }
+            }
+            KeyCode::Up => { if self.gs_sel > 0 { self.gs_sel -= 1; } }
+            KeyCode::Enter => {
+                // Navigate to the result's source screen
+                if let Some(r) = self.gs_results.get(self.gs_sel).cloned() {
+                    self.gs_open = false; self.input_mode = InputMode::Normal;
+                    match r.source {
+                        SearchSource::Notion   => { self.screen = Screen::Members; }
+                        SearchSource::Discord  => { self.screen = Screen::Discord; }
+                        SearchSource::Faq      => { self.screen = Screen::Faq; }
+                        SearchSource::Activity => { self.screen = Screen::Activity; }
+                    }
+                    self.status = format!("Jumped to {} ({})", r.title, r.id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        // Delegated to handle_editing since show_palette is checked there
+        self.handle_editing(key);
+    }
+
+    // ── Database cell edit keys ───────────────────────────────────────────────
 
     fn handle_db_edit_cell_key(&mut self, key: KeyEvent) {
         match key.code {
@@ -868,17 +1597,12 @@ impl App {
         }
     }
 
-    /// Left/Right inside the cell editor: toggles a checkbox, or cycles
-    /// through select/status options — mirroring how the Members form's
-    /// `←/→` field cycling is meant to behave.
     fn db_cycle_edit_value(&mut self, forward: bool) {
         let kind = self.db_edit_kind().unwrap_or_default();
         if kind == "checkbox" {
             self.db_edit_buf = if self.db_edit_buf == "true" || self.db_edit_buf == "✓" {
                 "false".into()
-            } else {
-                "true".into()
-            };
+            } else { "true".into() };
             return;
         }
         let opts = self.db_edit_options();
@@ -894,37 +1618,50 @@ impl App {
     }
 
     fn submit_db_cell_edit(&mut self) {
-        let cols = self.db_visible_columns();
-        if let Some(col) = cols.get(self.db_col_sel).cloned() {
-            if let Some(page) = self.db_rows.get(self.db_row_sel).cloned() {
-                let kind = self.db_edit_kind().unwrap_or_else(|| "rich_text".into());
-                let value = self.db_edit_buf.clone();
-                let mut props = HashMap::new();
-                props.insert(col.property_name.clone(), build_prop(&kind, &value));
-                if let Some(n) = self.notion.clone() {
-                    let tx = self.tx.clone();
-                    let pid = page.id.clone();
-                    tokio::spawn(async move {
-                        match n.update_page(&pid, props).await {
-                            Ok(p) => { let _ = tx.send(AppEvent::DbRowUpdated(p)); }
-                            Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
-                        }
-                    });
-                    let _ = self.logger.write("db_cell_update", &page.id, &format!("{}={value}", col.property_name), true);
-                }
+        // Scope the immutable borrow so we can mutate undo_stack afterwards.
+        let col_name = {
+            let cols = self.db_visible_columns();
+            cols.get(self.db_col_sel).map(|c| c.property_name.clone())
+        };
+        let Some(col_name) = col_name else {
+            self.db_mode = DbMode::Browse;
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+
+        if let Some(page) = self.db_rows.get(self.db_row_sel).cloned() {
+            // Push undo before updating (borrow of undo_stack is now safe).
+            let old_props = page.props.clone();
+            if self.undo_stack.len() >= 20 { self.undo_stack.remove(0); }
+            self.undo_stack.push(UndoAction::UpdatePage {
+                page_id: page.id.clone(), old_props,
+            });
+
+            let kind  = self.db_edit_kind().unwrap_or_else(|| "rich_text".into());
+            let value = self.db_edit_buf.clone();
+            let mut props = HashMap::new();
+            props.insert(col_name.clone(), build_prop(&kind, &value));
+            if let Some(n) = self.notion.clone() {
+                let tx = self.tx.clone(); let pid = page.id.clone();
+                tokio::spawn(async move {
+                    match n.update_page(&pid, props).await {
+                        Ok(p)  => { let _ = tx.send(AppEvent::DbRowUpdated(p)); }
+                        Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+                    }
+                });
+                let _ = self.logger.write("db_cell_update", &page.id,
+                    &format!("{}={value}", col_name), true);
             }
         }
         self.db_mode = DbMode::Browse;
         self.input_mode = InputMode::Normal;
     }
 
-    // ── Database tab: SwitchDatabase overlay key handling ─────────────────────
-
     fn handle_db_switch_key(&mut self, key: KeyEvent) {
         let filtered = self.db_filtered_indices();
         match key.code {
             KeyCode::Down => { if self.db_picker_sel + 1 < filtered.len() { self.db_picker_sel += 1; } }
-            KeyCode::Up => { if self.db_picker_sel > 0 { self.db_picker_sel -= 1; } }
+            KeyCode::Up   => { if self.db_picker_sel > 0 { self.db_picker_sel -= 1; } }
             KeyCode::Enter => {
                 if let Some(&idx) = filtered.get(self.db_picker_sel) {
                     if let Some(db) = self.db_available.get(idx).cloned() {
@@ -939,36 +1676,71 @@ impl App {
         }
     }
 
+    fn handle_db_body_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => { self.db_mode = DbMode::Browse; self.input_mode = InputMode::Normal; }
+            KeyCode::Char(c) => { self.db_body_append_buf.push(c); }
+            KeyCode::Backspace => { self.db_body_append_buf.pop(); }
+            KeyCode::Enter => {
+                let content = self.db_body_append_buf.clone();
+                if !content.is_empty() {
+                    if let Some(page) = self.db_rows.get(self.db_row_sel).cloned() {
+                        if let Some(n) = self.notion.clone() {
+                            let tx = self.tx.clone(); let pid = page.id.clone();
+                            tokio::spawn(async move {
+                                match n.append_page_body(&pid, &content).await {
+                                    Ok(_)  => { let _ = tx.send(AppEvent::StatusMsg("Body updated.".into())); }
+                                    Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
+                                }
+                            });
+                            self.db_body_append_buf.clear();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_db_preset_key(&mut self, key: KeyEvent) {
+        let n = self.db_filter_presets.len();
+        match key.code {
+            KeyCode::Esc => { self.db_mode = DbMode::Browse; self.input_mode = InputMode::Normal; }
+            KeyCode::Down => { if self.db_preset_sel + 1 < n { self.db_preset_sel += 1; } }
+            KeyCode::Up   => { if self.db_preset_sel > 0 { self.db_preset_sel -= 1; } }
+            KeyCode::Enter => {
+                if let Some(preset) = self.db_filter_presets.get(self.db_preset_sel).cloned() {
+                    let filter = preset.to_notion_filter();
+                    self.db_mode = DbMode::Browse;
+                    self.input_mode = InputMode::Normal;
+                    self.trigger_db_load_rows_filtered(filter);
+                    self.status = format!("Filter applied: {}", preset.name);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── Members screen keys ───────────────────────────────────────────────────
 
     async fn key_members(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.m_sel + 1 < self.m_pages.len() {
-                    self.m_sel += 1;
-                    self.m_list.select(Some(self.m_sel));
-                }
+                if self.m_sel + 1 < self.m_pages.len() { self.m_sel += 1; self.m_list.select(Some(self.m_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.m_sel > 0 {
-                    self.m_sel -= 1;
-                    self.m_list.select(Some(self.m_sel));
-                }
+                if self.m_sel > 0 { self.m_sel -= 1; self.m_list.select(Some(self.m_sel)); }
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.trigger_load_members(),
-            KeyCode::Char('/') => {
-                self.m_search_mode = true;
-                self.input_mode = InputMode::Editing;
-            }
+            KeyCode::Char('/') => { self.m_search_mode = true; self.input_mode = InputMode::Editing; }
             KeyCode::Enter if self.m_search_mode => {
-                self.m_search_mode = false;
-                self.input_mode = InputMode::Normal;
+                self.m_search_mode = false; self.input_mode = InputMode::Normal;
                 let q = self.m_search.clone();
                 if let Some(n) = self.notion.clone() {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match n.search_title(&q).await {
-                            Ok(p) => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
+                            Ok(p)  => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
                             Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                         }
                     });
@@ -978,26 +1750,21 @@ impl App {
                 if let Some(schema) = &self.m_schema {
                     self.m_form = Some(MemberForm::for_schema(schema));
                     self.input_mode = InputMode::Editing;
-                } else {
-                    self.status = "Schema not loaded yet. Press r to refresh.".into();
-                }
+                } else { self.status = "Schema not loaded. Press r.".into(); }
             }
             KeyCode::Char('e') => {
-                if let Some(page) = self.m_pages.get(self.m_sel).cloned() {
-                    if let Some(schema) = &self.m_schema {
-                        self.m_form = Some(MemberForm::for_edit(&page, schema));
-                        self.input_mode = InputMode::Editing;
-                    }
+                if let (Some(page), Some(schema)) = (self.m_pages.get(self.m_sel).cloned(), &self.m_schema) {
+                    self.m_form = Some(MemberForm::for_edit(&page, schema));
+                    self.input_mode = InputMode::Editing;
                 }
             }
             KeyCode::Char('d') => {
                 if let Some(page) = self.m_pages.get(self.m_sel).cloned() {
                     if let Some(n) = self.notion.clone() {
-                        let tx = self.tx.clone();
-                        self.m_loading = true;
+                        let tx = self.tx.clone(); self.m_loading = true;
                         tokio::spawn(async move {
                             match n.archive_page(&page.id).await {
-                                Ok(_) => { let _ = tx.send(AppEvent::MemberRemoved); }
+                                Ok(_)  => { let _ = tx.send(AppEvent::MemberRemoved); }
                                 Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                             }
                         });
@@ -1005,13 +1772,12 @@ impl App {
                 }
             }
             KeyCode::Char('u') => {
-                // Unarchive / restore
                 if let Some(page) = self.m_pages.get(self.m_sel).cloned() {
                     if let Some(n) = self.notion.clone() {
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
                             match n.unarchive_page(&page.id).await {
-                                Ok(_) => { let _ = tx.send(AppEvent::StatusMsg("Unarchived".into())); }
+                                Ok(_)  => { let _ = tx.send(AppEvent::StatusMsg("Unarchived.".into())); }
                                 Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                             }
                         });
@@ -1020,21 +1786,18 @@ impl App {
             }
             KeyCode::Enter if self.m_form.is_some() => {
                 if let Some(form) = &self.m_form {
-                    let props = form.to_props();
-                    let is_edit = form.is_edit;
-                    let page_id = form.page_id.clone();
+                    let props = form.to_props(); let is_edit = form.is_edit; let pid = form.page_id.clone();
                     if let Some(n) = self.notion.clone() {
-                        let tx = self.tx.clone();
-                        self.m_loading = true;
+                        let tx = self.tx.clone(); self.m_loading = true;
                         tokio::spawn(async move {
                             if is_edit {
-                                match n.update_page(&page_id.unwrap(), props).await {
-                                    Ok(p) => { let _ = tx.send(AppEvent::MemberUpdated(p)); }
+                                match n.update_page(&pid.unwrap(), props).await {
+                                    Ok(p)  => { let _ = tx.send(AppEvent::MemberUpdated(p)); }
                                     Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                                 }
                             } else {
                                 match n.create_page(props).await {
-                                    Ok(p) => { let _ = tx.send(AppEvent::MemberCreated(p)); }
+                                    Ok(p)  => { let _ = tx.send(AppEvent::MemberCreated(p)); }
                                     Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                                 }
                             }
@@ -1043,7 +1806,6 @@ impl App {
                 }
                 self.input_mode = InputMode::Normal;
             }
-            // Cycle select options with Left/Right
             KeyCode::Right | KeyCode::Left => {
                 if let Some(form) = &mut self.m_form {
                     let f = &mut form.fields[form.active];
@@ -1066,16 +1828,22 @@ impl App {
     // ── Discord screen keys ───────────────────────────────────────────────────
 
     async fn key_discord(&mut self, key: KeyEvent) {
+        let max_sections = 5; // 0=invite 1=members 2=kick 3=roles 4=broadcast
         match key.code {
             KeyCode::Tab => {
-                self.d_section = (self.d_section + 1) % 3;
-                if self.d_section == 1 { self.trigger_discord_members(); }
+                self.d_section = (self.d_section + 1) % max_sections;
+                match self.d_section {
+                    1 => self.trigger_discord_members(),
+                    3 => self.trigger_discord_roles(),
+                    _ => {}
+                }
             }
+            // Invite section
             KeyCode::Char('i') if self.d_section == 0 => self.trigger_discord_invite(),
             KeyCode::Char('c') if self.d_section == 0 => {
                 if !self.d_invite_result.is_empty() {
                     if crate::faq::copy_to_clipboard(&self.d_invite_result) {
-                        self.status = "Invite URL copied to clipboard!".into();
+                        self.status = "Invite URL copied!".into();
                     }
                 }
             }
@@ -1085,36 +1853,24 @@ impl App {
             KeyCode::Char('-') if self.d_section == 0 => {
                 if self.d_hours > 1 { self.d_hours -= 1; }
             }
+            // Members section
             KeyCode::Down | KeyCode::Char('j') if self.d_section == 1 => {
                 if self.d_sel + 1 < self.d_discord_members.len() {
-                    self.d_sel += 1;
-                    self.d_members_list.select(Some(self.d_sel));
+                    self.d_sel += 1; self.d_members_list.select(Some(self.d_sel));
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if self.d_section == 1 => {
-                if self.d_sel > 0 {
-                    self.d_sel -= 1;
-                    self.d_members_list.select(Some(self.d_sel));
-                }
+                if self.d_sel > 0 { self.d_sel -= 1; self.d_members_list.select(Some(self.d_sel)); }
             }
-            KeyCode::Char('/') => {
-                self.d_active_field = 2;
-                self.input_mode = InputMode::Editing;
-            }
-            KeyCode::Char('e') => {
-                self.input_mode = InputMode::Editing;
-                self.d_active_field = 0;
-            }
+            // Kick/ban section
             KeyCode::Char('k') if self.d_section == 2 => {
                 if let Some(d) = self.discord.clone() {
-                    let uid = self.d_action_input.clone();
-                    let reason = self.d_reason.clone();
-                    let tx = self.tx.clone();
-                    let task_uid = uid.clone();
+                    let (uid, reason) = (self.d_action_input.clone(), self.d_reason.clone());
+                    let tx = self.tx.clone(); let uid2 = uid.clone();
                     tokio::spawn(async move {
-                        let r = d.kick(&task_uid, &reason).await;
+                        let r = d.kick(&uid2, &reason).await;
                         let _ = tx.send(match r {
-                            Ok(_) => AppEvent::StatusMsg(format!("Kicked {task_uid}")),
+                            Ok(_)  => AppEvent::StatusMsg(format!("Kicked {uid2}")),
                             Err(e) => AppEvent::ErrMsg(e.to_string()),
                         });
                     });
@@ -1123,18 +1879,104 @@ impl App {
             }
             KeyCode::Char('b') if self.d_section == 2 => {
                 if let Some(d) = self.discord.clone() {
-                    let uid = self.d_action_input.clone();
-                    let reason = self.d_reason.clone();
-                    let tx = self.tx.clone();
-                    let task_uid = uid.clone();
+                    let (uid, reason) = (self.d_action_input.clone(), self.d_reason.clone());
+                    let tx = self.tx.clone(); let uid2 = uid.clone();
                     tokio::spawn(async move {
-                        let r = d.ban(&task_uid, &reason).await;
+                        let r = d.ban(&uid2, &reason).await;
                         let _ = tx.send(match r {
-                            Ok(_) => AppEvent::StatusMsg(format!("Banned {task_uid}")),
+                            Ok(_)  => AppEvent::StatusMsg(format!("Banned {uid2}")),
                             Err(e) => AppEvent::ErrMsg(e.to_string()),
                         });
                     });
                     let _ = self.logger.write("discord_ban", &uid, &self.d_reason, true);
+                }
+            }
+            // Roles section
+            KeyCode::Down | KeyCode::Char('j') if self.d_section == 3 => {
+                if self.d_role_sel + 1 < self.d_roles.len() {
+                    self.d_role_sel += 1; self.d_roles_list.select(Some(self.d_role_sel));
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.d_section == 3 => {
+                if self.d_role_sel > 0 { self.d_role_sel -= 1; self.d_roles_list.select(Some(self.d_role_sel)); }
+            }
+            KeyCode::Char('a') if self.d_section == 3 => {
+                // Assign selected role to user
+                if let Some(d) = self.discord.clone() {
+                    if let Some(role) = self.d_roles.get(self.d_role_sel).cloned() {
+                        let uid   = self.d_assign_user.clone();
+                        let uid2  = uid.clone(); // keep for logger after move
+                        let rid   = role.id.clone();
+                        let rname = role.name.clone();
+                        let tx    = self.tx.clone();
+                        tokio::spawn(async move {
+                            let r = d.assign_role(&uid, &rid).await;
+                            let _ = tx.send(match r {
+                                Ok(_)  => AppEvent::StatusMsg(format!("Role '{rname}' assigned to {uid}")),
+                                Err(e) => AppEvent::ErrMsg(e.to_string()),
+                            });
+                        });
+                        let _ = self.logger.write("discord_role_add", &uid2, &role.name, true);
+                    }
+                }
+            }
+            KeyCode::Char('x') if self.d_section == 3 => {
+                // Remove selected role from user
+                if let Some(d) = self.discord.clone() {
+                    if let Some(role) = self.d_roles.get(self.d_role_sel).cloned() {
+                        let uid   = self.d_assign_user.clone();
+                        let uid2  = uid.clone(); // keep for logger after move
+                        let rid   = role.id.clone();
+                        let rname = role.name.clone();
+                        let tx    = self.tx.clone();
+                        tokio::spawn(async move {
+                            let r = d.remove_role(&uid, &rid).await;
+                            let _ = tx.send(match r {
+                                Ok(_)  => AppEvent::StatusMsg(format!("Role '{rname}' removed from {uid}")),
+                                Err(e) => AppEvent::ErrMsg(e.to_string()),
+                            });
+                        });
+                        let _ = self.logger.write("discord_role_remove", &uid2, &role.name, true);
+                    }
+                }
+            }
+            // Broadcast section
+            KeyCode::Char('m') if self.d_section == 4 => {
+                // Send broadcast message
+                if let Some(d) = self.discord.clone() {
+                    let ch = self.d_broadcast_channel.clone();
+                    let msg = self.d_broadcast_msg.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let r = d.broadcast_message(&ch, &msg).await;
+                        let _ = tx.send(match r {
+                            Ok(_)  => AppEvent::StatusMsg("Message sent!".into()),
+                            Err(e) => AppEvent::ErrMsg(e.to_string()),
+                        });
+                    });
+                    let _ = self.logger.write("discord_broadcast", &self.d_broadcast_channel, &self.d_broadcast_msg, true);
+                }
+            }
+            // Audit log: press A to fetch (no separate section, shown in broadcast panel)
+            KeyCode::Char('A') => self.trigger_discord_audit(),
+            // Edit / search in any section
+            KeyCode::Char('e') => { self.input_mode = InputMode::Editing; self.d_active_field = 0; }
+            KeyCode::Char('/') => { self.d_active_field = 2; self.input_mode = InputMode::Editing; }
+            // DM from members section
+            KeyCode::Char('d') if self.d_section == 1 => {
+                if let Some(member) = self.d_discord_members.get(self.d_sel).cloned() {
+                    if let Some(d) = self.discord.clone() {
+                        let uid = member.user_id.clone();
+                        let msg = self.d_dm_msg.clone();
+                        let tx = self.tx.clone(); let uid2 = uid.clone();
+                        tokio::spawn(async move {
+                            let r = d.send_dm(&uid2, &msg).await;
+                            let _ = tx.send(match r {
+                                Ok(_)  => AppEvent::StatusMsg(format!("DM sent to {uid2}")),
+                                Err(e) => AppEvent::ErrMsg(e.to_string()),
+                            });
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1146,52 +1988,34 @@ impl App {
     fn key_faq(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.f_sel + 1 < self.f_filtered.len() {
-                    self.f_sel += 1;
-                    self.f_list.select(Some(self.f_sel));
-                }
+                if self.f_sel + 1 < self.f_filtered.len() { self.f_sel += 1; self.f_list.select(Some(self.f_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.f_sel > 0 {
-                    self.f_sel -= 1;
-                    self.f_list.select(Some(self.f_sel));
-                }
+                if self.f_sel > 0 { self.f_sel -= 1; self.f_list.select(Some(self.f_sel)); }
             }
-            KeyCode::Char('/') => {
-                self.f_search_mode = true;
-                self.input_mode = InputMode::Editing;
-            }
+            KeyCode::Char('/') => { self.f_search_mode = true; self.input_mode = InputMode::Editing; }
             KeyCode::Char('c') | KeyCode::Enter => {
-                // Copy selected snippet to clipboard
                 if let Some(&idx) = self.f_filtered.get(self.f_sel) {
                     if let Some(s) = self.faq.snippets.get(idx) {
                         self.f_copied = crate::faq::copy_to_clipboard(&s.content);
                         self.status = if self.f_copied {
                             format!("Copied '{}' to clipboard!", s.title)
-                        } else {
-                            format!("Clipboard failed – xclip/xsel not found. Content shown in preview.")
-                        };
-                        let _ = self.logger.write("faq_copy", &s.title, "copied to clipboard", self.f_copied);
+                        } else { "Clipboard unavailable – see preview.".into() };
+                        let _ = self.logger.write("faq_copy", &s.title, "copied", self.f_copied);
                     }
                 }
             }
             KeyCode::Char('p') => self.f_show_preview = !self.f_show_preview,
             KeyCode::Char('a') => {
-                self.f_form = Some(SnippetForm {
-                    id: None,
-                    title: String::new(), content: String::new(), tags: String::new(), active: 0,
-                });
+                self.f_form = Some(SnippetForm { id: None, title: String::new(), content: String::new(), tags: String::new(), active: 0 });
                 self.input_mode = InputMode::Editing;
             }
             KeyCode::Char('e') => {
                 if let Some(&idx) = self.f_filtered.get(self.f_sel) {
                     if let Some(s) = self.faq.snippets.get(idx) {
                         self.f_form = Some(SnippetForm {
-                            id: Some(s.id.clone()),
-                            title: s.title.clone(),
-                            content: s.content.clone(),
-                            tags: s.tags.join(", "),
-                            active: 0,
+                            id: Some(s.id.clone()), title: s.title.clone(),
+                            content: s.content.clone(), tags: s.tags.join(", "), active: 0,
                         });
                         self.input_mode = InputMode::Editing;
                     }
@@ -1208,8 +2032,7 @@ impl App {
                     };
                     match r {
                         Ok(_) => {
-                            self.status = "Snippet saved.".into();
-                            self.f_form = None;
+                            self.status = "Snippet saved.".into(); self.f_form = None;
                             let q = self.f_search.clone();
                             self.f_filtered = self.faq.filtered(&q);
                         }
@@ -1221,8 +2044,7 @@ impl App {
             KeyCode::Char('D') => {
                 if let Some(&idx) = self.f_filtered.get(self.f_sel) {
                     if let Some(s) = self.faq.snippets.get(idx) {
-                        let id = s.id.clone();
-                        let _ = self.faq.delete(&id);
+                        let id = s.id.clone(); let _ = self.faq.delete(&id);
                         let q = self.f_search.clone();
                         self.f_filtered = self.faq.filtered(&q);
                         if self.f_sel > 0 { self.f_sel -= 1; }
@@ -1240,42 +2062,30 @@ impl App {
     async fn key_payments(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('/') | KeyCode::Char('s') => {
-                self.p_search_mode = true;
-                self.p_active_field = 0;
-                self.input_mode = InputMode::Editing;
+                self.p_search_mode = true; self.p_active_field = 0; self.input_mode = InputMode::Editing;
             }
             KeyCode::Enter if self.p_active_field == 0 => {
-                // Search Notion for member
                 let q = self.p_search.clone();
                 if let Some(n) = self.notion.clone() {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match n.search_title(&q).await {
-                            Ok(p) => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
+                            Ok(p)  => { let _ = tx.send(AppEvent::MembersLoaded(p)); }
                             Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                         }
                     });
                 }
-                self.input_mode = InputMode::Normal;
-                self.p_search_mode = false;
+                self.input_mode = InputMode::Normal; self.p_search_mode = false;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.p_sel + 1 < self.p_results.len() {
-                    self.p_sel += 1;
-                    self.p_res_list.select(Some(self.p_sel));
-                }
+                if self.p_sel + 1 < self.p_results.len() { self.p_sel += 1; self.p_res_list.select(Some(self.p_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.p_sel > 0 {
-                    self.p_sel -= 1;
-                    self.p_res_list.select(Some(self.p_sel));
-                }
+                if self.p_sel > 0 { self.p_sel -= 1; self.p_res_list.select(Some(self.p_sel)); }
             }
             KeyCode::Char('v') => {
-                // Mark payment as verified – update a checkbox/select on the selected member
                 if let Some(page) = self.m_pages.get(self.p_sel).cloned() {
                     if let Some(schema) = &self.m_schema {
-                        // Find a "payment" or "paid" field in the schema
                         let pay_field = schema.props.iter().find(|p| {
                             let n = p.name.to_lowercase();
                             n.contains("pay") || n.contains("paid") || n.contains("status")
@@ -1285,22 +2095,18 @@ impl App {
                             let val = if field.kind == "checkbox" { "true" } else { self.p_status_val.as_str() };
                             props.insert(field.name.clone(), build_prop(&field.kind, val));
                             if let Some(n) = self.notion.clone() {
-                                let pid = page.id.clone();
-                                let tx = self.tx.clone();
+                                let pid = page.id.clone(); let tx = self.tx.clone();
                                 let fname = field.name.clone();
                                 tokio::spawn(async move {
                                     match n.update_page(&pid, props).await {
-                                        Ok(p) => {
-                                            let _ = tx.send(AppEvent::MemberUpdated(p));
-                                            let _ = tx.send(AppEvent::StatusMsg(format!("Payment verified for {pid}")));
-                                        }
+                                        Ok(p)  => { let _ = tx.send(AppEvent::MemberUpdated(p)); let _ = tx.send(AppEvent::StatusMsg(format!("Payment verified for {pid}"))); }
                                         Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                                     }
                                 });
-                                let _ = self.logger.write("payment_check", &page.id, &format!("{fname}={val} notes={}", self.p_notes), true);
+                                let _ = self.logger.write("payment_check", &page.id, &format!("{fname}={val}"), true);
                             }
                         } else {
-                            self.status = "No payment field found in schema. Edit member manually (2 → e).".into();
+                            self.status = "No payment field in schema. Edit manually (2 → e).".into();
                         }
                     }
                 }
@@ -1314,32 +2120,18 @@ impl App {
     fn key_activity(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.a_sel + 1 < self.a_logs.len() {
-                    self.a_sel += 1;
-                    self.a_list.select(Some(self.a_sel));
-                }
+                if self.a_sel + 1 < self.a_logs.len() { self.a_sel += 1; self.a_list.select(Some(self.a_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.a_sel > 0 {
-                    self.a_sel -= 1;
-                    self.a_list.select(Some(self.a_sel));
-                }
+                if self.a_sel > 0 { self.a_sel -= 1; self.a_list.select(Some(self.a_sel)); }
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.trigger_load_activity(),
-            KeyCode::Char('/') => {
-                self.a_filter_mode = true;
-                self.input_mode = InputMode::Editing;
-            }
+            KeyCode::Char('/') => { self.a_filter_mode = true; self.input_mode = InputMode::Editing; }
             KeyCode::Enter if self.a_filter_mode => {
-                self.a_filter_mode = false;
-                self.input_mode = InputMode::Normal;
+                self.a_filter_mode = false; self.input_mode = InputMode::Normal;
                 let q = self.a_filter.clone();
                 match if q.is_empty() { self.logger.recent(200) } else { self.logger.search(&q) } {
-                    Ok(logs) => {
-                        self.a_sel = 0;
-                        if !logs.is_empty() { self.a_list.select(Some(0)); }
-                        self.a_logs = logs;
-                    }
+                    Ok(logs) => { self.a_sel = 0; if !logs.is_empty() { self.a_list.select(Some(0)); } self.a_logs = logs; }
                     Err(e) => self.status = format!("Log error: {e}"),
                 }
             }
@@ -1352,25 +2144,15 @@ impl App {
     fn key_settings(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.s_sel + 1 < self.profiles.profiles.len() {
-                    self.s_sel += 1;
-                    self.s_list.select(Some(self.s_sel));
-                }
+                if self.s_sel + 1 < self.profiles.profiles.len() { self.s_sel += 1; self.s_list.select(Some(self.s_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.s_sel > 0 {
-                    self.s_sel -= 1;
-                    self.s_list.select(Some(self.s_sel));
-                }
+                if self.s_sel > 0 { self.s_sel -= 1; self.s_list.select(Some(self.s_sel)); }
             }
-            KeyCode::Char('a') => {
-                self.s_form = Some(ProfileForm::new());
-                self.input_mode = InputMode::Editing;
-            }
+            KeyCode::Char('a') => { self.s_form = Some(ProfileForm::new()); self.input_mode = InputMode::Editing; }
             KeyCode::Char('e') => {
                 if let Some(p) = self.profiles.profiles.get(self.s_sel) {
-                    self.s_form = Some(ProfileForm::from_profile(p));
-                    self.input_mode = InputMode::Editing;
+                    self.s_form = Some(ProfileForm::from_profile(p)); self.input_mode = InputMode::Editing;
                 }
             }
             KeyCode::Char('d') => {
@@ -1380,38 +2162,45 @@ impl App {
                 self.apply_active_profile();
                 self.status = "Profile deleted.".into();
             }
+            // Cycle theme for active profile
+            KeyCode::Char('t') => {
+                if let Some(p) = self.profiles.active_mut() {
+                    p.theme = p.theme.cycle();
+                    self.status = format!("Theme: {}", p.theme.label());
+                }
+                let _ = self.profiles.save();
+            }
             KeyCode::Enter if self.s_form.is_none() => {
                 let _ = self.profiles.set_active(self.s_sel);
                 self.apply_active_profile();
-                self.status = format!("Active profile: {}", self.profiles.active().map(|p| p.name.as_str()).unwrap_or("none"));
+                self.status = format!("Active: {}", self.profiles.active().map(|p| p.name.as_str()).unwrap_or("none"));
             }
             KeyCode::F(2) | KeyCode::Char('s') if self.s_form.is_some() => {
                 if let Some(form) = &self.s_form {
-                    // Carry over the existing database_tab config (column
-                    // layouts, active database) when editing a profile —
-                    // ProfileForm doesn't surface it, so without this an
-                    // edit-and-save from Settings would silently wipe out
-                    // anything configured on the Database tab (8).
                     let existing_db_tab = form.original_name.as_ref()
-                        .and_then(|name| self.profiles.profiles.iter().find(|p| &p.name == name))
+                        .and_then(|n| self.profiles.profiles.iter().find(|p| &p.name == n))
                         .map(|p| p.database_tab.clone())
                         .unwrap_or_default();
+                    let existing_theme = form.original_name.as_ref()
+                        .and_then(|n| self.profiles.profiles.iter().find(|p| &p.name == n))
+                        .map(|p| p.theme.clone())
+                        .unwrap_or_default();
+                    let existing_rules = form.original_name.as_ref()
+                        .and_then(|n| self.profiles.profiles.iter().find(|p| &p.name == n))
+                        .map(|p| p.automation_rules.clone())
+                        .unwrap_or_default();
                     let p = crate::config::Profile {
-                        name: form.name.clone(),
-                        notion_api_key: form.notion_key.clone(),
+                        name: form.name.clone(), notion_api_key: form.notion_key.clone(),
                         notion_database_id: form.notion_db.clone(),
                         discord_bot_token: form.discord_token.clone(),
                         discord_guild_id: form.discord_guild.clone(),
                         discord_default_channel_id: form.discord_channel.clone(),
                         extra: Default::default(),
-                        database_tab: existing_db_tab,
+                        theme: existing_theme, database_tab: existing_db_tab,
+                        automation_rules: existing_rules,
                     };
                     match self.profiles.upsert(p) {
-                        Ok(_) => {
-                            self.status = "Profile saved.".into();
-                            self.s_form = None;
-                            self.apply_active_profile();
-                        }
+                        Ok(_) => { self.status = "Profile saved.".into(); self.s_form = None; self.apply_active_profile(); }
                         Err(e) => self.status = format!("Save error: {e}"),
                     }
                 }
@@ -1422,15 +2211,12 @@ impl App {
     }
 
     // ── Database screen keys ──────────────────────────────────────────────────
-    // EditCell and SwitchDatabase sub-modes are handled in handle_editing()
-    // (see comment there) since they run while input_mode == Editing.
-    // Browse and ConfigureColumns run in input_mode == Normal and land here.
 
     fn key_database(&mut self, key: KeyEvent) {
         match self.db_mode {
-            DbMode::Browse => self.key_database_browse(key),
+            DbMode::Browse           => self.key_database_browse(key),
             DbMode::ConfigureColumns => self.key_database_configure(key),
-            DbMode::EditCell | DbMode::SwitchDatabase => {}
+            _ => {}
         }
     }
 
@@ -1438,16 +2224,10 @@ impl App {
         let visible_count = self.db_visible_columns().len();
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.db_row_sel + 1 < self.db_rows.len() {
-                    self.db_row_sel += 1;
-                    self.db_table.select(Some(self.db_row_sel));
-                }
+                if self.db_row_sel + 1 < self.db_rows.len() { self.db_row_sel += 1; self.db_table.select(Some(self.db_row_sel)); }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.db_row_sel > 0 {
-                    self.db_row_sel -= 1;
-                    self.db_table.select(Some(self.db_row_sel));
-                }
+                if self.db_row_sel > 0 { self.db_row_sel -= 1; self.db_table.select(Some(self.db_row_sel)); }
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
                 if visible_count > 0 { self.db_col_sel = (self.db_col_sel + 1) % visible_count; }
@@ -1459,44 +2239,35 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.trigger_db_load_rows(),
             KeyCode::Char('c') => {
-                if self.db_schema.is_some() {
-                    self.db_cfg_sel = 0;
-                    self.db_mode = DbMode::ConfigureColumns;
-                } else {
-                    self.status = "Schema not loaded yet. Press r to refresh.".into();
-                }
+                if self.db_schema.is_some() { self.db_cfg_sel = 0; self.db_mode = DbMode::ConfigureColumns; }
+                else { self.status = "Schema not loaded. Press r.".into(); }
             }
             KeyCode::Char('D') => {
                 self.db_mode = DbMode::SwitchDatabase;
-                self.db_picker_input.clear();
-                self.db_picker_sel = 0;
+                self.db_picker_input.clear(); self.db_picker_sel = 0;
                 self.input_mode = InputMode::Editing;
                 self.trigger_db_list_databases();
             }
-            KeyCode::Char('/') => {
-                self.db_search_mode = true;
-                self.input_mode = InputMode::Editing;
-            }
+            KeyCode::Char('/') => { self.db_search_mode = true; self.input_mode = InputMode::Editing; }
             KeyCode::Enter if self.db_search_mode => {
-                self.db_search_mode = false;
-                self.input_mode = InputMode::Normal;
+                self.db_search_mode = false; self.input_mode = InputMode::Normal;
                 let q = self.db_search.clone();
                 if let (Some(n), Some(db_id)) = (self.notion.clone(), self.db_database_id.clone()) {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match n.search_title_of(&db_id, &q).await {
-                            Ok(p) => { let _ = tx.send(AppEvent::DbRowsLoaded(p)); }
+                            Ok(p)  => { let _ = tx.send(AppEvent::DbRowsLoaded(p)); }
                             Err(e) => { let _ = tx.send(AppEvent::ErrMsg(e.to_string())); }
                         }
                     });
                 }
             }
+            // Open cell editor
             KeyCode::Char('e') | KeyCode::Enter => {
                 let cols = self.db_visible_columns();
-                let Some(col) = cols.get(self.db_col_sel) else { return };
+                let Some(col) = cols.get(self.db_col_sel) else { return; };
                 if !col.editable {
-                    self.status = "Column is read-only (toggle editable with 'c' → x).".into();
-                    return;
+                    self.status = "Column is read-only (toggle with c → x).".into(); return;
                 }
                 let property_name = col.property_name.clone();
                 if let Some(page) = self.db_rows.get(self.db_row_sel).cloned() {
@@ -1504,11 +2275,48 @@ impl App {
                     self.db_edit_buf = current.clone();
                     let opts = self.db_edit_options();
                     self.db_edit_opt_idx = opts.iter().position(|o| o == &current).unwrap_or(0);
-                    self.db_mode = DbMode::EditCell;
-                    self.input_mode = InputMode::Editing;
-                } else {
-                    self.status = "No row selected.".into();
+                    self.db_mode = DbMode::EditCell; self.input_mode = InputMode::Editing;
                 }
+            }
+            // Open page body viewer (Track C)
+            KeyCode::Char('b') => {
+                self.db_page_body.clear(); self.db_body_append_buf.clear();
+                self.db_mode = DbMode::ViewBody; self.input_mode = InputMode::Editing;
+                self.trigger_db_page_body();
+            }
+            // Filter presets (Track C)
+            KeyCode::Char('f') => {
+                if self.db_filter_presets.is_empty() {
+                    self.status = "No filter presets saved. Save presets via :auto-filter (coming soon).".into();
+                } else {
+                    self.db_preset_sel = 0;
+                    self.db_mode = DbMode::FilterPresets;
+                    self.input_mode = InputMode::Editing;
+                }
+            }
+            // Bulk select toggle (Track C)
+            KeyCode::Char(' ') => {
+                self.db_bulk_mode = true;
+                if self.db_bulk_sel.contains(&self.db_row_sel) {
+                    self.db_bulk_sel.remove(&self.db_row_sel);
+                } else {
+                    self.db_bulk_sel.insert(self.db_row_sel);
+                }
+                self.status = format!("{} rows selected", self.db_bulk_sel.len());
+            }
+            // Bulk archive
+            KeyCode::Char('X') if self.db_bulk_mode && !self.db_bulk_sel.is_empty() => {
+                let ids: Vec<String> = self.db_bulk_sel.iter()
+                    .filter_map(|&i| self.db_rows.get(i).map(|p| p.id.clone()))
+                    .collect();
+                if let Some(n) = self.notion.clone() {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        for id in &ids { let _ = n.archive_page(id).await; }
+                        let _ = tx.send(AppEvent::StatusMsg(format!("Archived {} rows", ids.len())));
+                    });
+                }
+                self.db_bulk_sel.clear(); self.db_bulk_mode = false;
             }
             KeyCode::Char('s') => self.save_db_config(),
             _ => {}
@@ -1519,29 +2327,81 @@ impl App {
         let n = self.db_columns.len();
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => { if self.db_cfg_sel + 1 < n { self.db_cfg_sel += 1; } }
-            KeyCode::Up | KeyCode::Char('k') => { if self.db_cfg_sel > 0 { self.db_cfg_sel -= 1; } }
-            KeyCode::Char(' ') => {
-                if let Some(c) = self.db_columns.get_mut(self.db_cfg_sel) { c.visible = !c.visible; }
-            }
-            KeyCode::Char('x') => {
-                if let Some(c) = self.db_columns.get_mut(self.db_cfg_sel) { c.editable = !c.editable; }
-            }
+            KeyCode::Up | KeyCode::Char('k')   => { if self.db_cfg_sel > 0 { self.db_cfg_sel -= 1; } }
+            KeyCode::Char(' ') => { if let Some(c) = self.db_columns.get_mut(self.db_cfg_sel) { c.visible = !c.visible; } }
+            KeyCode::Char('x') => { if let Some(c) = self.db_columns.get_mut(self.db_cfg_sel) { c.editable = !c.editable; } }
             KeyCode::Char('J') => {
-                if self.db_cfg_sel + 1 < n {
-                    self.db_columns.swap(self.db_cfg_sel, self.db_cfg_sel + 1);
-                    self.db_cfg_sel += 1;
-                }
+                if self.db_cfg_sel + 1 < n { self.db_columns.swap(self.db_cfg_sel, self.db_cfg_sel + 1); self.db_cfg_sel += 1; }
             }
             KeyCode::Char('K') => {
-                if self.db_cfg_sel > 0 {
-                    self.db_columns.swap(self.db_cfg_sel, self.db_cfg_sel - 1);
-                    self.db_cfg_sel -= 1;
-                }
+                if self.db_cfg_sel > 0 { self.db_columns.swap(self.db_cfg_sel, self.db_cfg_sel - 1); self.db_cfg_sel -= 1; }
             }
             KeyCode::Char('s') => self.save_db_config(),
-            KeyCode::Enter | KeyCode::Esc => {
-                self.db_mode = DbMode::Browse;
-                self.db_col_sel = 0;
+            KeyCode::Enter | KeyCode::Esc => { self.db_mode = DbMode::Browse; self.db_col_sel = 0; }
+            _ => {}
+        }
+    }
+
+    // ── Analytics screen keys (Track D) ──────────────────────────────────────
+
+    fn key_analytics(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::F(5) => self.trigger_analytics(),
+            KeyCode::Char('e') => self.trigger_export_csv(),
+            _ => {}
+        }
+    }
+
+    // ── Automation screen keys (Track F) ─────────────────────────────────────
+
+    async fn key_automation(&mut self, key: KeyEvent) {
+        let n = self.auto_rules.len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.auto_sel + 1 < n { self.auto_sel += 1; self.auto_list.select(Some(self.auto_sel)); }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.auto_sel > 0 { self.auto_sel -= 1; self.auto_list.select(Some(self.auto_sel)); }
+            }
+            KeyCode::Char('a') => {
+                self.auto_form = Some(AutoRuleForm::new());
+                self.input_mode = InputMode::Editing;
+            }
+            KeyCode::Char('e') => {
+                if let Some(rule) = self.auto_rules.get(self.auto_sel).cloned() {
+                    self.auto_form = Some(AutoRuleForm::from_rule(&rule));
+                    self.input_mode = InputMode::Editing;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if self.auto_sel < self.auto_rules.len() {
+                    self.auto_rules.remove(self.auto_sel);
+                    if self.auto_sel > 0 { self.auto_sel -= 1; }
+                    self.auto_list.select(Some(self.auto_sel));
+                    self.save_automation_rules();
+                    self.status = "Rule deleted.".into();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(rule) = self.auto_rules.get(self.auto_sel).cloned() {
+                    self.trigger_run_rule(rule);
+                }
+            }
+            // Run all
+            KeyCode::Char('R') => self.trigger_run_all_rules(),
+            // Toggle enabled
+            KeyCode::Char(' ') => {
+                if let Some(rule) = self.auto_rules.get_mut(self.auto_sel) {
+                    rule.enabled = !rule.enabled;
+                    self.save_automation_rules();
+                }
+            }
+            // Open onboarding form
+            KeyCode::Char('o') => {
+                self.auto_onboard_form = Some(OnboardForm {
+                    name: String::new(), email: String::new(), channel: String::new(), active: 0,
+                });
+                self.input_mode = InputMode::Editing;
             }
             _ => {}
         }

@@ -7,9 +7,9 @@ use crate::error::Result;
 pub struct LogEntry {
     pub id: i64,
     pub ts: String,
-    pub kind: String,   // notion_add | notion_update | notion_remove | discord_invite | faq_copy | payment_check
-    pub target: String, // member name or resource ID
-    pub detail: String, // extra context
+    pub kind: String,
+    pub target: String,
+    pub detail: String,
     pub ok: bool,
 }
 
@@ -29,7 +29,8 @@ impl ActivityLogger {
         Ok(logger)
     }
 
-    fn conn(&self) -> Result<Connection> {
+    /// pub(crate) so analytics.rs can run its own queries.
+    pub(crate) fn conn(&self) -> Result<Connection> {
         Ok(Connection::open(&self.path)?)
     }
 

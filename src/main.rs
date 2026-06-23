@@ -6,6 +6,9 @@ mod faq;
 mod logger;
 mod notion;
 mod ui;
+mod analytics;
+mod automation;
+
 
 use std::{io, time::Duration};
 use crossterm::{
